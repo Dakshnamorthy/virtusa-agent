@@ -5,11 +5,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from cidan.config import ROOT
+from cidan.config import get_settings
 
 logger = logging.getLogger(__name__)
-WORKFLOWS_DIR = ROOT / "outputs" / "workflows"
-AUDIT_PATH = ROOT / "outputs" / "audit.jsonl"
+OUTPUTS_DIRECTORY = get_settings().outputs_directory
+WORKFLOWS_DIR = OUTPUTS_DIRECTORY / "workflows"
+AUDIT_PATH = OUTPUTS_DIRECTORY / "audit.jsonl"
 
 
 def workflow_path(workflow_id: str) -> Path:

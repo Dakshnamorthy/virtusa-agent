@@ -14,6 +14,7 @@ class Settings:
     llm_model: str
     embedding_model: str
     chroma_persist_directory: Path
+    outputs_directory: Path
     source_pdf_directory: Path
     log_level: str
     max_pdf_bytes: int = 25 * 1024 * 1024
@@ -28,15 +29,16 @@ class Settings:
 def get_settings() -> Settings:
     source_dir = Path(os.getenv("SOURCE_PDF_DIRECTORY", "data/source_pdfs"))
     chroma_dir = Path(os.getenv("CHROMA_PERSIST_DIRECTORY", "storage/chroma"))
-    if not source_dir.is_absolute():
-        source_dir = ROOT / source_dir
-    if not chroma_dir.is_absolute():
-        chroma_dir = ROOT / chroma_dir
+    outputs_dir = Path(os.getenv("OUTPUTS_DIRECTORY", "outputs"))
+    source_dir = source_dir if source_dir.is_absolute() else ROOT / source_dir
+    chroma_dir = chroma_dir if chroma_dir.is_absolute() else ROOT / chroma_dir
+    outputs_dir = outputs_dir if outputs_dir.is_absolute() else ROOT / outputs_dir
     return Settings(
         groq_api_key=os.getenv("GROQ_API_KEY") or None,
         llm_model=os.getenv("LLM_MODEL", "qwen/qwen3.8-27b"),
         embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         chroma_persist_directory=chroma_dir,
+        outputs_directory=outputs_dir,
         source_pdf_directory=source_dir,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
     )

@@ -92,6 +92,35 @@ IDs prevent duplicates. The persistent vector index is under `storage/chroma/`.
 Workflow state and local audit events are saved under `outputs/`; reports are under
 `outputs/reports/<workflow-id>/`.
 
+## Docker and Render
+
+Build and run the API locally from the project root. Keep `.env` out of the image;
+pass it at runtime instead:
+
+```powershell
+docker build -t cidan .
+docker run --rm -p 8000:8000 --env-file .env cidan
+```
+
+For Render, create a **Web Service** from the repository and select **Docker** as
+the runtime. Add `GROQ_API_KEY` as a secret environment variable in Render; do not
+commit it or place it in the Dockerfile. Set `LLM_MODEL` and `EMBEDDING_MODEL` as
+needed. The container listens on Render's `PORT` environment variable.
+
+If the service needs to retain its Chroma index, workflow records, audit log, and
+reports across restarts and deploys, attach a Render persistent disk at `/var/data`
+and set:
+
+- `CHROMA_PERSIST_DIRECTORY=/var/data/chroma`
+- `OUTPUTS_DIRECTORY=/var/data/outputs`
+
+Without a persistent disk, those generated files are ephemeral. The FastEmbed model
+may also need to download again after an instance replacement.
+
+**Deployment security:** this API currently has no authentication. Do not expose this
+prototype as a public service or put real/private data in it until authentication and
+appropriate access controls have been added. The demo PDFs are synthetic.
+
 To start the API:
 
 ```powershell
