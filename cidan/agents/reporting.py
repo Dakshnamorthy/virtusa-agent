@@ -3,23 +3,54 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
-
-from cidan.agents.base import invoke_structured
 from cidan.models import Obligation, PolicyFinding, RuleProposal, TestSummary
 
 
-class ReportNarrative(BaseModel):
-    executive_summary: str
-    operational_impact: str
-    recommended_human_review_actions: list[str]
-    evidence_limitations: list[str]
-    deployment_readiness_assessment: str
-
-
-SYSTEM = """Summarize only structured results provided. Distinguish source facts from
-model interpretation, assumptions and unknowns. The loan circular is synthetic, not
-official RBI material. Never claim compliance, legal effect, approval or readiness."""
+def _build_narrative(
+    obligations: list[Obligation],
+    findings: list[PolicyFinding],
+    proposals: list[RuleProposal],
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    review_findings = [
+        item for item in findings
+        if item.status in {"partially_covered", "not_found", "potential_conflict", "requires_human_review"}
+    ]
+    actions = list(dict.fromkeys(
+        item.recommended_action.strip()
+        for item in review_findings
+        if item.recommended_action.strip()
+    ))
+    limitations = list(dict.fromkeys(
+        [
+            limitation.strip()
+            for item in findings
+            for limitation in item.evidence_limitations
+            if limitation.strip()
+        ] + [
+            ambiguity.strip()
+            for item in obligations
+            for ambiguity in item.ambiguities
+            if ambiguity.strip()
+        ]
+    ))
+    return {
+        "executive_summary": (
+            f"Extracted {metrics['obligations_extracted']} obligations and generated "
+            f"{metrics['policy_findings']} policy findings. "
+            f"{metrics['draft_rules_generated']} draft rules were generated; "
+            f"{metrics['tests_passed']} of {metrics['tests_total']} synthetic tests passed."
+        ),
+        "operational_impact": (
+            f"{len(review_findings)} policy findings require or recommend human review. "
+            "This report does not determine legal compliance or production readiness."
+        ),
+        "recommended_human_review_actions": actions[:5],
+        "evidence_limitations": limitations[:10],
+        "deployment_readiness_assessment": (
+            "Not assessed for production deployment; human review is required."
+        ),
+    }
 
 
 def run(
@@ -27,7 +58,6 @@ def run(
     findings: list[PolicyFinding],
     proposals: list[RuleProposal],
     tests: list[TestSummary],
-    llm_call=invoke_structured,
 ) -> dict:
     status_counts: dict[str, int] = {}
     for finding in findings:
@@ -45,57 +75,12 @@ def run(
     }
     total = int(metrics["tests_total"])
     metrics["test_pass_rate"] = int(metrics["tests_passed"]) / total if total else None
-    narrative_input = {
-        "obligation_summaries": [
-            {
-                "obligation_id": item.obligation_id,
-                "text": item.text,
-                "applicability": item.applicability,
-                "required_action": item.required_action,
-                "ambiguities": item.ambiguities,
-                "confidence": item.confidence,
-                "source": {
-                    "filename": item.source.filename,
-                    "page": item.source.page,
-                    "excerpt": item.source.excerpt[:250],
-                },
-            }
-            for item in obligations
-        ],
-        "policy_findings": [
-            {
-                "obligation_id": item.obligation_id,
-                "status": item.status,
-                "reasoning": item.reasoning,
-                "missing_or_inconsistent": item.missing_or_inconsistent,
-                "operational_impact": item.operational_impact,
-                "recommended_action": item.recommended_action,
-                "evidence_limitations": item.evidence_limitations,
-            }
-            for item in findings
-        ],
-        "rule_proposals": [
-            {
-                "rule_id": item.rule_id,
-                "business_purpose": item.business_purpose,
-                "description": item.description,
-                "risk_level": item.risk_level,
-                "unresolved_questions": item.unresolved_questions,
-            }
-            for item in proposals
-        ],
-        "computed_test_metrics": metrics,
-    }
-    narrative = llm_call(
-        ReportNarrative, SYSTEM,
-        f"Summarize these structured results:\n{narrative_input}",
-    )
     return {
         "report_id": "CIDAN-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f"),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_status": "synthetic_demo_source",
         "disclaimer": "Synthetic demo only; not an official RBI circular or legal advice.",
-        "narrative": narrative.model_dump(mode="json"),
+        "narrative": _build_narrative(obligations, findings, proposals, metrics),
         "metrics": metrics,
         "obligations": [item.model_dump(mode="json") for item in obligations],
         "policy_findings": [item.model_dump(mode="json") for item in findings],

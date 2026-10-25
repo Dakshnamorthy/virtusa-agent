@@ -17,26 +17,10 @@ def test_report_metrics_come_from_executed_test_results():
         ],
     )
 
-    class Narrative:
-        def model_dump(self, mode):
-            assert mode == "json"
-            return {
-                "executive_summary": "Review required.",
-                "operational_impact": "Local only.",
-                "recommended_human_review_actions": [],
-                "evidence_limitations": [],
-                "deployment_readiness_assessment": "Not deployment-ready.",
-            }
-
-    def fake_llm(_schema, _system_prompt, user_prompt):
-        assert _schema.__name__ == "ReportNarrative"
-        assert "Summarize only structured results" in _system_prompt
-        assert "'tests_total': 2" in user_prompt
-        assert "'tests_passed': 1" in user_prompt
-        return Narrative()
-
-    report = build_report([], [], [], [summary], llm_call=fake_llm)
+    report = build_report([], [], [], [summary])
     assert report["metrics"]["tests_total"] == 2
     assert report["metrics"]["tests_passed"] == 1
     assert report["metrics"]["tests_failed"] == 1
     assert report["metrics"]["test_pass_rate"] == 0.5
+    assert "1 of 2 synthetic tests passed" in report["narrative"]["executive_summary"]
+    assert "Not assessed for production deployment" in report["narrative"]["deployment_readiness_assessment"]

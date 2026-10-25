@@ -1,9 +1,9 @@
 # CIDAN — Regulatory Circular to Live Rule Engine
 
 CIDAN is a locally run, backend-only regulatory document analysis prototype. It reads
-source PDFs, indexes text in local ChromaDB, uses five LangChain structured-output
-agents coordinated by LangGraph, and executes only validated declarative rules in a
-restricted local sandbox.
+source PDFs, indexes text in local ChromaDB, uses four LangChain structured-output
+agents coordinated by LangGraph, builds a deterministic impact report from their
+results, and executes only validated declarative rules in a restricted local sandbox.
 
 **The loan approval circular in this project is synthetic demo material. Its ₹80,000
 threshold and illustrative effective date are fictional, not official RBI
@@ -153,7 +153,7 @@ bearer-token authentication; use Swagger's **Authorize** button. Main endpoints:
 - `GET /documents` — detected source PDFs and metadata.
 - `POST /documents/upload` — replace the current source pair with a handbook and circular.
 - `POST /ingest` — parse, chunk, embed, and index the PDFs.
-- `POST /workflows/analyze` — run all five agents and persist the results.
+- `POST /workflows/analyze` — run the four LLM agents, build a deterministic report, and persist the results.
 - `GET /workflows`, `GET /workflows/{workflow_id}` — prior workflow state.
 - `GET /workflows/{workflow_id}/report` and `/report/markdown` — saved report.
 - `GET /rules` and `GET /rules/{rule_id}` — proposal status and evidence.
@@ -211,7 +211,7 @@ Remove-Item Env:CIDAN_RUN_LLM_INTEGRATION
 - `cidan/ingestion/` — safe PDF discovery, page extraction, chunking, Chroma storage,
   and cited retrieval.
 - `cidan/agents/` — obligation extraction, semantic mapping, rule proposals, synthetic
-  tests, and impact reporting.
+  tests, and deterministic impact reporting.
 - `cidan/workflow/` — typed LangGraph state, execution, and local persistence.
 - `cidan/rule_engine.py` — allowlisted schema validation and deterministic interpreter.
 - `cidan/services/` — workflow execution, approval and export preview controls.
