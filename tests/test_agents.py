@@ -228,7 +228,9 @@ def test_policy_mapping_agent_uses_cited_passages():
 
     def fake_llm(schema, system, prompt):
         assert "semantic" in system
+        assert "one short sentence" in system
         assert obligation.text in prompt
+        assert "do not repeat the obligation" in prompt
         return schema(
             status=finding.status,
             reasoning=finding.reasoning,
@@ -242,6 +244,43 @@ def test_policy_mapping_agent_uses_cited_passages():
 
     result = policy_mapping.run([obligation], [policy_document()], llm_call=fake_llm)
     assert result[0].status == "partially_covered"
+
+
+def test_policy_mapping_schema_bounds_generated_text():
+    with pytest.raises(ValueError):
+        policy_mapping.MappingJudgment(
+            status="covered",
+            reasoning="r" * 181,
+            missing_or_inconsistent="none",
+            operational_impact="none",
+            recommended_action="review",
+            confidence=0.8,
+            cited_policy_chunk_ids=[],
+        )
+
+    with pytest.raises(ValueError):
+        policy_mapping.MappingJudgment(
+            status="covered",
+            reasoning="covered",
+            missing_or_inconsistent="none",
+            operational_impact="none",
+            recommended_action="review",
+            confidence=0.8,
+            evidence_limitations=["limit"] * 3,
+            cited_policy_chunk_ids=[],
+        )
+
+    with pytest.raises(ValueError):
+        policy_mapping.MappingJudgment(
+            status="covered",
+            reasoning="covered",
+            missing_or_inconsistent="none",
+            operational_impact="none",
+            recommended_action="review",
+            confidence=0.8,
+            evidence_limitations=["l" * 101],
+            cited_policy_chunk_ids=[],
+        )
 
 
 def test_rule_authoring_agent_returns_unapproved_constrained_proposal():
