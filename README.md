@@ -25,6 +25,10 @@ Do not use a real regulatory document as a substitute for the synthetic circular
 PDFs must be text-readable (not image-only scans), and each file must be at most 25 MB.
 If discovery does not find exactly one handbook and one circular, `/documents` and the
 CLI report where to place or rename them. The existing file names are recognized.
+The hosted API also accepts a new pair at the authenticated `POST /documents/upload`
+endpoint. Name the handbook with `policy`, `handbook`, or `rules`, and the circular
+with `circular`, `regulatory`, or `rbi`. Uploading replaces the PDFs in the configured
+source directory; run `POST /ingest` after upload and before analysis.
 
 ## Requirements and setup (Windows PowerShell)
 
@@ -55,23 +59,27 @@ defaults:
 ```powershell
 $secret = Read-Host "Groq API key" -AsSecureString
 $groqKey = [System.Net.NetworkCredential]::new("", $secret).Password
+$accessToken = python -c "import secrets; print(secrets.token_urlsafe(32))"
 $lines = @(Get-Content .env | Where-Object {
-    $_ -notmatch '^(OPENAI_API_KEY|GROQ_API_KEY|LLM_MODEL|EMBEDDING_MODEL)='
+    $_ -notmatch '^(OPENAI_API_KEY|GROQ_API_KEY|CIDAN_ACCESS_TOKEN|LLM_MODEL|EMBEDDING_MODEL)='
 })
 $lines += "GROQ_API_KEY=$groqKey"
+$lines += "CIDAN_ACCESS_TOKEN=$accessToken"
 $lines += "LLM_MODEL=qwen/qwen3.8-27b"
 $lines += "EMBEDDING_MODEL=BAAI/bge-small-en-v1.5"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllLines((Join-Path (Get-Location) ".env"), $lines, $utf8NoBom)
-Remove-Variable groqKey, secret
+Remove-Variable groqKey, secret, accessToken
 ```
 
 `.env` is git-ignored. The reasoning agents use Groq through `langchain-groq`; the
 default chat model is `qwen/qwen3.8-27b`. Chroma embeddings are generated locally
 with FastEmbed (`BAAI/bge-small-en-v1.5`), so no OpenAI key or embedding service is
 used. FastEmbed downloads its model the first time it runs, so initial ingestion needs
-internet access; later runs use its local cache. `/health` confirms whether a Groq key
-is configured, but a real request is needed to verify that the key is valid.
+internet access; later runs use its local cache. `/health` reports whether the Groq
+key and access token are configured, but a real request is needed to verify the Groq key.
+Keep `CIDAN_ACCESS_TOKEN` private; it protects API operations except `/health` and the
+Swagger/OpenAPI documentation page.
 
 ## Ingest, run, and inspect
 
@@ -103,23 +111,29 @@ docker run --rm -p 8000:8000 --env-file .env cidan
 ```
 
 For Render, create a **Web Service** from the repository and select **Docker** as
-the runtime. Add `GROQ_API_KEY` as a secret environment variable in Render; do not
-commit it or place it in the Dockerfile. Set `LLM_MODEL` and `EMBEDDING_MODEL` as
-needed. The container listens on Render's `PORT` environment variable.
+the runtime. Add `GROQ_API_KEY` and `CIDAN_ACCESS_TOKEN` as secret environment variables
+in Render; do not commit either value or place it in the Dockerfile. Set `LLM_MODEL`
+and `EMBEDDING_MODEL` as needed. The container listens on Render's `PORT` environment
+variable.
 
-If the service needs to retain its Chroma index, workflow records, audit log, and
-reports across restarts and deploys, attach a Render persistent disk at `/var/data`
-and set:
+To allow authorized testers to upload their own PDF pair and preserve the uploaded
+PDFs, Chroma index, workflow records, audit log, and reports across restarts, attach
+a Render persistent disk mounted at `/var/data` and set:
 
+- `SOURCE_PDF_DIRECTORY=/var/data/source_pdfs`
 - `CHROMA_PERSIST_DIRECTORY=/var/data/chroma`
 - `OUTPUTS_DIRECTORY=/var/data/outputs`
 
-Without a persistent disk, those generated files are ephemeral. The FastEmbed model
-may also need to download again after an instance replacement.
+Without a persistent disk, uploads and generated data are ephemeral. Render persistent
+disks require a service plan that supports disks.
 
-**Deployment security:** this API currently has no authentication. Do not expose this
-prototype as a public service or put real/private data in it until authentication and
-appropriate access controls have been added. The demo PDFs are synthetic.
+The API protects operational endpoints with one shared bearer token, not individual
+user accounts. In Swagger, click **Authorize** and enter the `CIDAN_ACCESS_TOKEN`.
+Upload one handbook and one circular at `POST /documents/upload`, then run
+`POST /ingest`, followed by `POST /workflows/analyze`. Share the token only with
+authorized testers using a secure channel. Use only synthetic or otherwise approved
+test PDFs; do not upload confidential/customer data. Revoke and replace the token if
+it is exposed.
 
 To start the API:
 
@@ -127,10 +141,12 @@ To start the API:
 uvicorn cidan.api:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Open Swagger at <http://127.0.0.1:8000/docs>. Main endpoints:
+Open Swagger at <http://127.0.0.1:8000/docs>. Operational endpoints require
+bearer-token authentication; use Swagger's **Authorize** button. Main endpoints:
 
-- `GET /health` — Groq configuration and local embedding-provider status; never the key.
+- `GET /health` — Groq/access configuration and local embedding-provider status; never credentials.
 - `GET /documents` — detected source PDFs and metadata.
+- `POST /documents/upload` — replace the current source pair with a handbook and circular.
 - `POST /ingest` — parse, chunk, embed, and index the PDFs.
 - `POST /workflows/analyze` — run all five agents and persist the results.
 - `GET /workflows`, `GET /workflows/{workflow_id}` — prior workflow state.
@@ -140,8 +156,8 @@ Open Swagger at <http://127.0.0.1:8000/docs>. Main endpoints:
 - `POST /rules/{rule_id}/export-preview` — requires explicit local approval.
 
 When the server is running, `Invoke-RestMethod http://127.0.0.1:8000/health` reports
-configuration state without returning the key. `Invoke-RestMethod
-http://127.0.0.1:8000/documents` reports source discovery and index freshness.
+configuration state without returning credentials. Use Swagger's **Authorize** button
+to call protected endpoints.
 
 Approval is only a local prototype record. Export is a preview package and never
 connects to a production rule engine or any banking service. Approval and export

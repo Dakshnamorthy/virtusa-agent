@@ -11,6 +11,7 @@ load_dotenv(ROOT / ".env")
 @dataclass(frozen=True)
 class Settings:
     groq_api_key: str | None
+    cidan_access_token: str | None
     llm_model: str
     embedding_model: str
     chroma_persist_directory: Path
@@ -35,6 +36,7 @@ def get_settings() -> Settings:
     outputs_dir = outputs_dir if outputs_dir.is_absolute() else ROOT / outputs_dir
     return Settings(
         groq_api_key=os.getenv("GROQ_API_KEY") or None,
+        cidan_access_token=os.getenv("CIDAN_ACCESS_TOKEN") or None,
         llm_model=os.getenv("LLM_MODEL", "qwen/qwen3.8-27b"),
         embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         chroma_persist_directory=chroma_dir,
