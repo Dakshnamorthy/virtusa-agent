@@ -43,6 +43,14 @@ def make_obligation():
     )
 
 
+def make_obligation_candidate(obligation=None, **updates):
+    item = obligation or make_obligation()
+    data = item.model_dump(exclude={"obligation_id", "source", "source_label", "status"})
+    data["source_chunk_id"] = item.source.chunk_id
+    data.update(updates)
+    return circular_understanding.ObligationCandidate.model_validate(data)
+
+
 def policy_document():
     citation = make_citation("policy_handbook")
     return Document(
@@ -64,7 +72,8 @@ def test_circular_agent_accepts_only_exact_source_evidence():
         assert "untrusted evidence" in system
         assert "Extract obligations from these circular passages" in prompt
         assert obligation.supporting_excerpt in prompt
-        return schema(obligations=[obligation])
+        assert "Omit no required fields" in prompt
+        return schema(obligations=[make_obligation_candidate(obligation)])
 
     docs = [Document(
         page_content=obligation.supporting_excerpt,
@@ -89,7 +98,7 @@ def test_circular_agent_uses_exact_chunk_citation_for_nonverbatim_excerpt():
     def fake_llm(schema, system, prompt):
         assert "untrusted evidence" in system
         assert "Extract obligations" in prompt
-        return schema(obligations=[obligation])
+        return schema(obligations=[make_obligation_candidate(obligation)])
 
     docs = [Document(
         page_content=make_obligation().supporting_excerpt,
@@ -108,6 +117,49 @@ def test_circular_agent_uses_exact_chunk_citation_for_nonverbatim_excerpt():
     assert any("not verbatim" in item for item in result[0].ambiguities)
 
 
+def test_circular_agent_handles_omitted_excerpt_as_needing_review():
+    candidate = make_obligation_candidate(supporting_excerpt="")
+    document = Document(
+        page_content=make_obligation().supporting_excerpt,
+        metadata={
+            "document_id": "source-doc",
+            "filename": "CIDAN_Synthetic_Loan_Circular.pdf",
+            "document_type": "circular",
+            "page": 1,
+            "chunk_id": "chunk-1",
+        },
+    )
+
+    result = circular_understanding.run(
+        [document],
+        llm_call=lambda schema, _system, _prompt: schema(obligations=[candidate]),
+    )
+
+    assert result[0].supporting_excerpt == document.page_content
+    assert result[0].confidence <= 0.5
+    assert any("not verbatim" in item for item in result[0].ambiguities)
+
+
+def test_circular_agent_rejects_unknown_source_chunk():
+    candidate = make_obligation_candidate(source_chunk_id="unretrieved-chunk")
+    document = Document(
+        page_content=make_obligation().supporting_excerpt,
+        metadata={
+            "document_id": "source-doc",
+            "filename": "CIDAN_Synthetic_Loan_Circular.pdf",
+            "document_type": "circular",
+            "page": 1,
+            "chunk_id": "chunk-1",
+        },
+    )
+
+    with pytest.raises(ValueError, match="does not identify a retrieved circular passage"):
+        circular_understanding.run(
+            [document],
+            llm_call=lambda schema, _system, _prompt: schema(obligations=[candidate]),
+        )
+
+
 def test_circular_agent_rebuilds_citation_metadata_from_exact_source():
     obligation = make_obligation().model_copy(update={
         "source": make_citation().model_copy(update={
@@ -118,7 +170,7 @@ def test_circular_agent_rebuilds_citation_metadata_from_exact_source():
     })
 
     def fake_llm(schema, _system, _prompt):
-        return schema(obligations=[obligation])
+        return schema(obligations=[make_obligation_candidate(obligation)])
 
     docs = [Document(
         page_content=obligation.supporting_excerpt,
@@ -140,7 +192,7 @@ def test_circular_agent_withholds_threshold_not_in_cited_source():
     obligation = make_obligation().model_copy(update={"amount_threshold": 180_000})
 
     def fake_llm(schema, _system, _prompt):
-        return schema(obligations=[obligation])
+        return schema(obligations=[make_obligation_candidate(obligation)])
 
     docs = [Document(
         page_content=obligation.supporting_excerpt,
