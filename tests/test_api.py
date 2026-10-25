@@ -30,6 +30,7 @@ def test_health_does_not_expose_api_key():
     assert "test-access-token" not in response.text
     assert response.json()["llm_provider"] == "groq"
     assert response.json()["embedding_provider"] == "fastembed_local"
+    assert response.json()["llm_max_output_tokens"] == 400
 
 
 def test_groq_configuration_does_not_use_openai_key(monkeypatch):

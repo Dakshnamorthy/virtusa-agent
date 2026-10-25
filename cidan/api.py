@@ -65,6 +65,7 @@ def health() -> dict[str, Any]:
         "access_control_configured": bool(settings.cidan_access_token),
         "llm_provider": "groq",
         "llm_model": settings.llm_model,
+        "llm_max_output_tokens": settings.llm_max_output_tokens,
         "embedding_model": settings.embedding_model,
         "embedding_provider": "fastembed_local",
         "source_directory": str(settings.source_pdf_directory),

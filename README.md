@@ -61,11 +61,12 @@ $secret = Read-Host "Groq API key" -AsSecureString
 $groqKey = [System.Net.NetworkCredential]::new("", $secret).Password
 $accessToken = python -c "import secrets; print(secrets.token_urlsafe(32))"
 $lines = @(Get-Content .env | Where-Object {
-    $_ -notmatch '^(OPENAI_API_KEY|GROQ_API_KEY|CIDAN_ACCESS_TOKEN|LLM_MODEL|EMBEDDING_MODEL)='
+    $_ -notmatch '^(OPENAI_API_KEY|GROQ_API_KEY|CIDAN_ACCESS_TOKEN|LLM_MODEL|LLM_MAX_OUTPUT_TOKENS|EMBEDDING_MODEL)='
 })
 $lines += "GROQ_API_KEY=$groqKey"
 $lines += "CIDAN_ACCESS_TOKEN=$accessToken"
 $lines += "LLM_MODEL=qwen/qwen3.8-27b"
+$lines += "LLM_MAX_OUTPUT_TOKENS=400"
 $lines += "EMBEDDING_MODEL=BAAI/bge-small-en-v1.5"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllLines((Join-Path (Get-Location) ".env"), $lines, $utf8NoBom)
@@ -112,7 +113,11 @@ docker run --rm -p 8000:8000 --env-file .env cidan
 
 For Render, create a **Web Service** from the repository and select **Docker** as
 the runtime. Add `GROQ_API_KEY` and `CIDAN_ACCESS_TOKEN` as secret environment variables
-in Render; do not commit either value or place it in the Dockerfile. Set `LLM_MODEL`
+in Render; do not commit either value or place it in the Dockerfile. Set
+`LLM_MAX_OUTPUT_TOKENS=400` to limit each LLM call's requested output tokens (the app
+also defaults to 400). This can reduce OTPM rate-limit errors, but cannot guarantee
+they will not happen if other requests use the same quota. A value that is too low can
+truncate structured responses and cause workflow validation errors. Set `LLM_MODEL`
 and `EMBEDDING_MODEL` as needed. The container listens on Render's `PORT` environment
 variable.
 
@@ -144,7 +149,7 @@ uvicorn cidan.api:app --host 127.0.0.1 --port 8000 --reload
 Open Swagger at <http://127.0.0.1:8000/docs>. Operational endpoints require
 bearer-token authentication; use Swagger's **Authorize** button. Main endpoints:
 
-- `GET /health` — Groq/access configuration and local embedding-provider status; never credentials.
+- `GET /health` — Groq/access configuration, output token limit, and local embedding-provider status; never credentials.
 - `GET /documents` — detected source PDFs and metadata.
 - `POST /documents/upload` — replace the current source pair with a handbook and circular.
 - `POST /ingest` — parse, chunk, embed, and index the PDFs.

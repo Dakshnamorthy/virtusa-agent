@@ -20,7 +20,7 @@ class Settings:
     log_level: str
     max_pdf_bytes: int = 25 * 1024 * 1024
     llm_timeout_seconds: float = 60
-    llm_max_output_tokens: int = 850
+    llm_max_output_tokens: int = 400
 
     @property
     def llm_configured(self) -> bool:
@@ -31,6 +31,12 @@ def get_settings() -> Settings:
     source_dir = Path(os.getenv("SOURCE_PDF_DIRECTORY", "data/source_pdfs"))
     chroma_dir = Path(os.getenv("CHROMA_PERSIST_DIRECTORY", "storage/chroma"))
     outputs_dir = Path(os.getenv("OUTPUTS_DIRECTORY", "outputs"))
+    try:
+        llm_max_output_tokens = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "400"))
+    except ValueError as exc:
+        raise ValueError("LLM_MAX_OUTPUT_TOKENS must be a positive integer.") from exc
+    if llm_max_output_tokens < 1:
+        raise ValueError("LLM_MAX_OUTPUT_TOKENS must be a positive integer.")
     source_dir = source_dir if source_dir.is_absolute() else ROOT / source_dir
     chroma_dir = chroma_dir if chroma_dir.is_absolute() else ROOT / chroma_dir
     outputs_dir = outputs_dir if outputs_dir.is_absolute() else ROOT / outputs_dir
@@ -43,6 +49,7 @@ def get_settings() -> Settings:
         outputs_directory=outputs_dir,
         source_pdf_directory=source_dir,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        llm_max_output_tokens=llm_max_output_tokens,
     )
 
 
