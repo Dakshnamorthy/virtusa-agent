@@ -1,0 +1,15 @@
+# Python 3.11-3.12; compatible LangChain 0.3 generation.
+langchain>=0.3.27,<0.4
+langchain-community>=0.3.31,<0.4
+langchain-groq>=0.3.8,<0.4
+langchain-chroma>=0.2.6,<0.3
+langchain-text-splitters>=0.3.11,<0.4
+langgraph>=0.6.6,<0.7
+chromadb>=1.0.20,<2
+fastembed>=0.7.4,<1
+PyMuPDF>=1.26.4,<2
+pydantic>=2.11,<3
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+python-dotenv>=1.0,<2
+pytest>=8.3,<10
