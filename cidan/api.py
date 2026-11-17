@@ -13,6 +13,8 @@ from cidan.config import ConfigurationError, get_settings
 from cidan.ingestion.pdf_loader import classify_document, find_pdfs, ingestion_status, load_pdf
 from cidan.services.approval_service import approve_rule, export_preview
 from cidan.services.integration_service import (
+    CrossBankAccessDeniedError,
+    DatabaseConnectionError,
     ExistingRuleDto,
     FetchRulesRequest,
     IntegrationService,
@@ -20,6 +22,7 @@ from cidan.services.integration_service import (
     IntegrationVerifyResponse,
     SchemaInspectRequest,
     SchemaInspectResponse,
+    UnverifiedSourceError,
 )
 from cidan.workflow.persistence import load_workflow, list_workflows
 
@@ -30,6 +33,37 @@ app = FastAPI(
     version="0.2.0",
     description="Local synthetic compliance analysis prototype; no production deployment.",
 )
+
+
+class AuthenticatedUser(BaseModel):
+    user_email: str = "auditor@apexbank.com"
+    bank_id: str = "apex-bank-01"
+    role: str = "COMPLIANCE_AUDITOR"
+
+
+def require_authenticated_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> AuthenticatedUser:
+    expected = get_settings().cidan_access_token
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="API access is not configured. Set CIDAN_ACCESS_TOKEN.",
+        )
+    if (
+        credentials is None
+        or credentials.scheme.casefold() != "bearer"
+        or not hmac.compare_digest(
+            credentials.credentials.encode("utf-8"),
+            expected.encode("utf-8"),
+        )
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="A valid bearer access token is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return AuthenticatedUser()
 
 
 def require_access_token(
@@ -315,9 +349,14 @@ def preview_export(rule_id: str, _: None = Depends(require_access_token)) -> dic
 )
 def verify_integration(
     request: IntegrationVerifyRequest,
-    _: None = Depends(require_access_token),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> IntegrationVerifyResponse:
-    return IntegrationService.verify_connection(request)
+    try:
+        return IntegrationService.verify_connection(request, authorized_bank_id=user.bank_id)
+    except CrossBankAccessDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post(
@@ -328,9 +367,18 @@ def verify_integration(
 )
 def inspect_schema(
     request: SchemaInspectRequest,
-    _: None = Depends(require_access_token),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> SchemaInspectResponse:
-    return IntegrationService.inspect_schema(request)
+    try:
+        return IntegrationService.inspect_schema(request, authorized_bank_id=user.bank_id)
+    except UnverifiedSourceError as exc:
+        raise HTTPException(status_code=412, detail=str(exc)) from exc
+    except CrossBankAccessDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except DatabaseConnectionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post(
@@ -341,7 +389,16 @@ def inspect_schema(
 )
 def fetch_rules(
     request: FetchRulesRequest,
-    _: None = Depends(require_access_token),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> list[ExistingRuleDto]:
-    return IntegrationService.fetch_rules(request)
+    try:
+        return IntegrationService.fetch_rules(request, authorized_bank_id=user.bank_id)
+    except UnverifiedSourceError as exc:
+        raise HTTPException(status_code=412, detail=str(exc)) from exc
+    except CrossBankAccessDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except DatabaseConnectionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 

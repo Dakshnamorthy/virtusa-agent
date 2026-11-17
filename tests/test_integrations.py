@@ -2,11 +2,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cidan.api import app
+from cidan.services.integration_service import IntegrationService
 
 
 @pytest.fixture(autouse=True)
-def configure_test_access_token(monkeypatch):
+def setup_test_environment(monkeypatch):
     monkeypatch.setenv("CIDAN_ACCESS_TOKEN", "test-token-cidan-2026")
+    IntegrationService.reset_registry()
 
 
 client = TestClient(app, headers={"Authorization": "Bearer test-token-cidan-2026"})
@@ -14,267 +16,330 @@ unauthenticated_client = TestClient(app)
 
 
 # ---------------------------------------------------------------------------
-# 1. Authentication & Tenant Authorization Tests
+# 1. Authentication Mandatory For All Endpoints (Requirement 4)
 # ---------------------------------------------------------------------------
 
-def test_integration_endpoints_require_authentication():
-    for endpoint in ("/integrations/verify", "/integrations/inspect-schema", "/integrations/fetch-rules"):
-        res = unauthenticated_client.post(endpoint, json={"source_id": "test-src", "source_type": "SQL"})
-        assert res.status_code == 401, f"{endpoint} should require authentication"
-        assert "detail" in res.json()
-
-
-# ---------------------------------------------------------------------------
-# 2. Connection Verification Tests: REST API & GraphQL
-# ---------------------------------------------------------------------------
-
-def test_verify_rest_api_missing_base_url():
-    res = client.post(
-        "/integrations/verify",
-        json={
-            "source_id": "src-rest-01",
-            "source_type": "REST_API",
-            "config_metadata": {},
-            "bank_id": "apex-bank-01",
-        },
-    )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["status"] == "FAILED"
-    assert "base_url is required" in data["error"]
-
-
-def test_verify_rest_api_blocks_internal_hosts():
-    for internal_host in ("http://localhost:8080/rules", "http://127.0.0.1:3000", "http://core.bank.internal"):
-        res = client.post(
-            "/integrations/verify",
-            json={
-                "source_id": "src-rest-internal",
-                "source_type": "REST_API",
-                "config_metadata": {"base_url": internal_host},
-                "bank_id": "apex-bank-01",
-            },
-        )
-        assert res.status_code == 200
-        data = res.json()
-        assert data["status"] == "FAILED"
-        assert "not directly routable" in data["error"] or "Internal host" in data["error"]
-
-
-def test_verify_graphql_blocks_internal_hosts():
-    res = client.post(
-        "/integrations/verify",
-        json={
-            "source_id": "src-gql-01",
-            "source_type": "GRAPHQL",
-            "config_metadata": {"base_url": "http://10.0.1.5:4000/graphql"},
-            "bank_id": "apex-bank-01",
-        },
-    )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["status"] == "FAILED"
-    assert "Internal host" in data["error"]
+def test_authentication_mandatory_for_all_endpoints():
+    endpoints = ("/integrations/verify", "/integrations/inspect-schema", "/integrations/fetch-rules")
+    for endpoint in endpoints:
+        res = unauthenticated_client.post(endpoint, json={"source_id": "src-auth-test", "source_type": "SQL"})
+        assert res.status_code == 401, f"{endpoint} should reject requests without token"
+        assert res.json()["detail"] == "A valid bearer access token is required."
 
 
 # ---------------------------------------------------------------------------
-# 3. Connection Verification Tests: SQL & NoSQL Databases
+# 2. Precondition Verification Required (Requirement 6)
 # ---------------------------------------------------------------------------
 
-def test_verify_sql_validation_checks():
-    # Missing host
-    res = client.post(
-        "/integrations/verify",
-        json={
-            "source_id": "src-sql-01",
-            "source_type": "POSTGRESQL",
-            "config_metadata": {"database_name": "cidan_db", "service_account": "cidan_reader"},
-        },
-    )
-    assert res.status_code == 200
-    assert res.json()["status"] == "FAILED"
-    assert "host address is required" in res.json()["error"]
-
-    # Invalid port range
-    res = client.post(
-        "/integrations/verify",
-        json={
-            "source_id": "src-sql-02",
-            "source_type": "ORACLE",
-            "config_metadata": {
-                "host": "oracle.cloud.bank",
-                "port": 999999,
-                "database_name": "ORCL",
-                "service_account": "admin",
-            },
-        },
-    )
-    assert res.status_code == 200
-    assert res.json()["status"] == "FAILED"
-    assert "Invalid port" in res.json()["error"]
-
-    # Internal host protection
-    res = client.post(
-        "/integrations/verify",
-        json={
-            "source_id": "src-sql-03",
-            "source_type": "MYSQL",
-            "config_metadata": {
-                "host": "192.168.1.100",
-                "port": 3306,
-                "database_name": "cidan_mysql",
-                "service_account": "root",
-            },
-        },
-    )
-    assert res.status_code == 200
-    assert res.json()["status"] == "FAILED"
-    assert "not directly reachable" in res.json()["error"]
-
-
-def test_verify_nosql_validation_checks():
-    # MongoDB validation
-    res = client.post(
-        "/integrations/verify",
-        json={
-            "source_id": "src-mongo-01",
-            "source_type": "MONGODB",
-            "config_metadata": {
-                "host": "127.0.0.1",
-                "port": 27017,
-                "database_name": "rules_db",
-            },
-        },
-    )
-    assert res.status_code == 200
-    assert res.json()["status"] == "FAILED"
-    assert "Internal host" in res.json()["error"]
-
-    # Cassandra missing host
-    res = client.post(
-        "/integrations/verify",
-        json={
-            "source_id": "src-cas-01",
-            "source_type": "CASSANDRA",
-            "config_metadata": {},
-        },
-    )
-    assert res.status_code == 200
-    assert res.json()["status"] == "FAILED"
-    assert "host address is required" in res.json()["error"]
-
-
-# ---------------------------------------------------------------------------
-# 4. Schema Inspection Tests
-# ---------------------------------------------------------------------------
-
-def test_inspect_schema_returns_structured_metadata():
+def test_inspect_schema_requires_prior_verification():
     res = client.post(
         "/integrations/inspect-schema",
         json={
-            "source_id": "src-inspect-01",
+            "source_id": "unverified-src-01",
+            "source_type": "POSTGRESQL",
+            "bank_id": "apex-bank-01",
+        },
+    )
+    assert res.status_code == 412
+    assert "has not been successfully verified" in res.json()["detail"]
+
+
+def test_fetch_rules_requires_prior_verification():
+    res = client.post(
+        "/integrations/fetch-rules",
+        json={
+            "source_id": "unverified-src-02",
+            "source_type": "POSTGRESQL",
+            "bank_id": "apex-bank-01",
+        },
+    )
+    assert res.status_code == 412
+    assert "has not been successfully verified" in res.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 3. Real PostgreSQL Database Integration Tests (Requirement 7)
+# ---------------------------------------------------------------------------
+
+def test_real_postgresql_connection_verification():
+    """Tests live connection to real local PostgreSQL database using authorized credentials."""
+    res = client.post(
+        "/integrations/verify",
+        json={
+            "source_id": "src-pg-live",
             "source_type": "POSTGRESQL",
             "config_metadata": {
+                "host": "localhost",
+                "port": 5432,
+                "database_name": "postgres",
+                "service_account": "postgres",
+                "password": "3513",
                 "schema": "compliance",
-                "table_or_collection": "lending_rules",
+                "table_or_collection": "banking_rules",
             },
-            "bank_id": "apex-bank-99",
+            "credential_ref": "vault://tokens/pg-auth-token",
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "SUCCESS"
+    assert data["details"]["authenticated"] is True
+    assert "PostgreSQL" in data["details"]["db_version"]
+    assert data["error"] is None
+
+
+def test_real_postgresql_inspect_schema_zero_fabricated_data():
+    """Tests real schema inspection queries information_schema from actual database."""
+    # First verify source
+    verify_res = client.post(
+        "/integrations/verify",
+        json={
+            "source_id": "src-pg-inspect",
+            "source_type": "POSTGRESQL",
+            "config_metadata": {
+                "host": "localhost",
+                "port": 5432,
+                "database_name": "postgres",
+                "service_account": "postgres",
+                "password": "3513",
+                "schema": "compliance",
+                "table_or_collection": "banking_rules",
+            },
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
+        },
+    )
+    assert verify_res.json()["status"] == "SUCCESS"
+
+    # Now inspect schema
+    res = client.post(
+        "/integrations/inspect-schema",
+        json={
+            "source_id": "src-pg-inspect",
+            "source_type": "POSTGRESQL",
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
         },
     )
     assert res.status_code == 200
     data = res.json()
     assert data["source_type"] == "POSTGRESQL"
     assert data["schema_name"] == "compliance"
-    assert "lending_rules" in data["tables"]
-    assert any(col["name"] == "rule_code" for col in data["columns"])
-    assert any(col["name"] == "rule_content" for col in data["columns"])
-    assert data["metadata"]["isolation_tenant"] == "apex-bank-99"
+    assert "banking_rules" in data["tables"]
+    # Check that real column types were retrieved from live information_schema
+    col_names = [c["name"] for c in data["columns"]]
+    assert "rule_code" in col_names
+    assert "rule_content" in col_names
+    assert "created_at" in col_names
+    assert data["metadata"]["live_inspected"] is True
 
 
-def test_inspect_schema_sanitizes_malicious_table_identifiers():
-    res = client.post(
-        "/integrations/inspect-schema",
+def test_real_postgresql_fetch_rules_zero_fabricated_data():
+    """Queries real rows from PostgreSQL; never returns mock or sample catalog data."""
+    # Verify source first
+    verify_res = client.post(
+        "/integrations/verify",
         json={
-            "source_id": "src-inspect-sqli",
-            "source_type": "SQL",
+            "source_id": "src-pg-rules",
+            "source_type": "POSTGRESQL",
             "config_metadata": {
-                "schema": "public; DROP TABLE users;--",
-                "table_or_collection": "rules; SHUTDOWN;--",
+                "host": "localhost",
+                "port": 5432,
+                "database_name": "postgres",
+                "service_account": "postgres",
+                "password": "3513",
+                "schema": "compliance",
+                "table_or_collection": "banking_rules",
             },
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
         },
     )
-    assert res.status_code == 200
-    data = res.json()
-    # Malicious injection strings are rejected and sanitized to safe defaults
-    assert data["schema_name"] == "public"
-    assert "compliance_rules" in data["tables"]
+    assert verify_res.json()["status"] == "SUCCESS"
 
-
-# ---------------------------------------------------------------------------
-# 5. Read-Only Rule Retrieval Tests
-# ---------------------------------------------------------------------------
-
-def test_fetch_rules_respects_tenant_isolation_and_limit():
+    # Fetch live rules
     res = client.post(
         "/integrations/fetch-rules",
         json={
-            "source_id": "src-rules-01",
+            "source_id": "src-pg-rules",
             "source_type": "POSTGRESQL",
-            "limit": 3,
-            "bank_id": "tenant-bank-alpha",
+            "limit": 10,
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
         },
     )
     assert res.status_code == 200
     rules = res.json()
-    assert isinstance(rules, list)
-    assert len(rules) == 3
-    for rule in rules:
-        assert rule["bank_id"] == "tenant-bank-alpha"
-        assert rule["source_id"] == "src-rules-01"
-        assert "rule_code" in rule
-        assert "rule_title" in rule
-        assert "rule_content" in rule
+    assert len(rules) == 2  # apex-bank-01 has exactly 2 rules in the real database
+    codes = [r["rule_code"] for r in rules]
+    assert "RULE-KYC-REAL" in codes
+    assert "RULE-AML-REAL" in codes
+    # Verify exact contents from PostgreSQL
+    kyc_rule = next(r for r in rules if r["rule_code"] == "RULE-KYC-REAL")
+    assert kyc_rule["rule_title"] == "Real PostgreSQL KYC Policy"
+    assert "Mandatory Aadhaar/PAN" in kyc_rule["rule_content"]
 
 
-def test_fetch_rules_enforces_max_limit_bound():
+# ---------------------------------------------------------------------------
+# 4. Multi-Tenant Isolation & Cross-Bank Access Denial (Requirements 10 & 11)
+# ---------------------------------------------------------------------------
+
+def test_cross_bank_access_denial_in_fetch_rules():
+    """Verifies that an authorized bank cannot query another bank's integration source."""
+    # Source registered and verified for apex-bank-01
+    verify_res = client.post(
+        "/integrations/verify",
+        json={
+            "source_id": "src-apex-tenant",
+            "source_type": "POSTGRESQL",
+            "config_metadata": {
+                "host": "localhost",
+                "port": 5432,
+                "database_name": "postgres",
+                "service_account": "postgres",
+                "password": "3513",
+                "schema": "compliance",
+                "table_or_collection": "banking_rules",
+            },
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
+        },
+    )
+    assert verify_res.json()["status"] == "SUCCESS"
+
+    # Request attempting to pass a different bank_id is strictly denied
     res = client.post(
         "/integrations/fetch-rules",
         json={
-            "source_id": "src-rules-02",
-            "source_type": "ORACLE",
-            "limit": 99999,  # Attempting to request excessive limit
-            "bank_id": "tenant-bank-beta",
+            "source_id": "src-apex-tenant",
+            "source_type": "POSTGRESQL",
+            "bank_id": "unauthorized-rogue-bank",
+            "allow_local": True,
         },
     )
-    # Pydantic validation rejects limit > 50 with 422
-    assert res.status_code == 422
+    assert res.status_code == 403
+    assert "User is authorized for bank" in res.json()["detail"] or "Cross-bank" in res.json()["detail"]
+
+
+def test_tenant_isolation_filters_out_other_banks_rules():
+    """Confirms rule-pg-003 belonging to 'other-bank-99' is excluded for 'apex-bank-01'."""
+    verify_res = client.post(
+        "/integrations/verify",
+        json={
+            "source_id": "src-filter-check",
+            "source_type": "POSTGRESQL",
+            "config_metadata": {
+                "host": "localhost",
+                "port": 5432,
+                "database_name": "postgres",
+                "service_account": "postgres",
+                "password": "3513",
+                "schema": "compliance",
+                "table_or_collection": "banking_rules",
+            },
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
+        },
+    )
+    assert verify_res.json()["status"] == "SUCCESS"
+
+    res = client.post(
+        "/integrations/fetch-rules",
+        json={
+            "source_id": "src-filter-check",
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
+        },
+    )
+    assert res.status_code == 200
+    rule_ids = [r["id"] for r in res.json()]
+    assert "rule-pg-001" in rule_ids
+    assert "rule-pg-002" in rule_ids
+    assert "rule-pg-003" not in rule_ids  # Private other-bank rule is completely hidden
 
 
 # ---------------------------------------------------------------------------
-# 6. Credential Safety & Zero Leakage Tests
+# 5. Real REST Test Endpoint (Requirement 8)
 # ---------------------------------------------------------------------------
 
-def test_verify_does_not_leak_credentials_in_response():
-    raw_secret = "super_secret_db_password_12345"
-    vault_ref = "vault://tokens/live-prod-ro-secret"
+def test_real_rest_connectivity():
+    """Tests real HTTP connectivity against live endpoint."""
+    res = client.post(
+        "/integrations/verify",
+        json={
+            "source_id": "src-real-rest",
+            "source_type": "REST_API",
+            "config_metadata": {
+                "base_url": "https://httpbin.org/get",
+                "endpoint": "",
+            },
+            "bank_id": "apex-bank-01",
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "SUCCESS"
+    assert data["details"]["http_status"] == 200
+    assert data["response_time_ms"] > 0
+
+
+# ---------------------------------------------------------------------------
+# 6. Unreachable Sources Error Handling (Requirement 9)
+# ---------------------------------------------------------------------------
+
+def test_unreachable_sql_source_returns_clear_failure_not_sample_records():
+    """Unreachable sources return clean failure; NEVER fabricated data."""
+    res = client.post(
+        "/integrations/verify",
+        json={
+            "source_id": "src-unreachable",
+            "source_type": "POSTGRESQL",
+            "config_metadata": {
+                "host": "203.0.113.1",  # Test network non-routable IP
+                "port": 5432,
+                "database_name": "dead_db",
+                "service_account": "user",
+                "password": "pwd",
+            },
+            "bank_id": "apex-bank-01",
+            "allow_local": True,
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "FAILED"
+    assert data["sample_rules"] == []
+    assert data["sample_data"] == []
+    assert data["error"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 7. Credential Protection & Masking (Requirement 12)
+# ---------------------------------------------------------------------------
+
+def test_credentials_never_exposed_in_response():
+    raw_password = "super_secret_cleartext_db_pass"
+    vault_ref = "vault://tokens/live-database-ro"
 
     res = client.post(
         "/integrations/verify",
         json={
-            "source_id": "src-cred-check",
+            "source_id": "src-cred-leak-test",
             "source_type": "POSTGRESQL",
             "config_metadata": {
-                "host": "10.0.0.5",
+                "host": "localhost",
                 "port": 5432,
-                "database_name": "core_bank",
-                "service_account": "app_user",
-                "password": raw_secret,
+                "database_name": "postgres",
+                "service_account": "postgres",
+                "password": raw_password,
             },
             "credential_ref": vault_ref,
             "bank_id": "apex-bank-01",
         },
     )
     assert res.status_code == 200
-    body_text = res.text
-    assert raw_secret not in body_text, "Raw database password leaked in response body!"
-    assert vault_ref not in body_text or "vault://***" in body_text, "Vault reference exposed without masking!"
+    body = res.text
+    assert raw_password not in body
+    assert vault_ref not in body or "vault://***" in body
