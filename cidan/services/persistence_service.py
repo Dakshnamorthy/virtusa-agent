@@ -10,8 +10,14 @@ import os
 import uuid
 from typing import Any, Optional
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    psycopg2 = None  # type: ignore
+    RealDictCursor = None  # type: ignore
+    PSYCOPG2_AVAILABLE = False
 
 from cidan.services.delta_analysis_service import (
     DeltaAnalysisResult,
@@ -30,8 +36,12 @@ from cidan.services.rule_validation_service import ValidationFinding
 logger = logging.getLogger(__name__)
 
 
-def _get_db_connection() -> Optional[psycopg2.extensions.connection]:
+def _get_db_connection() -> Optional[Any]:
     """Attempts to obtain a live connection to PostgreSQL / Supabase."""
+    if not PSYCOPG2_AVAILABLE or psycopg2 is None:
+        logger.debug("psycopg2 is not installed. Operating in cache fallback mode.")
+        return None
+
     # Priority: explicit DATABASE_URL -> local dev DB
     db_url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
     if not db_url:
