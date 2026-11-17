@@ -108,6 +108,53 @@ def test_extract_rules_from_text():
     assert rules[0].category == "GENERAL" or rules[0].category == "AML"
 
 
+def test_extract_rules_from_yaml():
+    yaml_content = """
+    rule_id: YAML-AML-01
+    rule_name: YAML Cash Threshold
+    category: AML
+    condition_tree:
+      operator: AND
+      conditions:
+        - field: transaction_amount
+          operator: gte
+          value: 750000
+    actions:
+      - action_type: FLAG_REVIEW
+        target: transaction
+    """
+    rules = extract_rules_from_existing_content(yaml_content, "policy.yaml", "yaml", "apex-bank-01")
+    assert len(rules) == 1
+    assert rules[0].rule_id == "YAML-AML-01"
+    assert rules[0].category == "AML"
+
+
+def test_extract_rules_from_xml():
+    xml_content = """
+    <rules>
+      <rule id="XML-KYC-01">
+        <name>XML Non-Resident Due Diligence</name>
+        <category>KYC</category>
+        <condition field="is_nre" operator="eq" value="true"/>
+      </rule>
+    </rules>
+    """
+    rules = extract_rules_from_existing_content(xml_content, "rules.xml", "xml", "apex-bank-01")
+    assert len(rules) == 1
+    assert rules[0].rule_id == "XML-KYC-01"
+    assert rules[0].category == "KYC"
+
+
+def test_extract_rules_rejects_unsupported_format():
+    with pytest.raises(ValueError, match="Unsupported file format 'exe'"):
+        extract_rules_from_existing_content("binarydata", "installer.exe", "exe", "apex-bank-01")
+
+
+def test_extract_rules_rejects_empty_content():
+    with pytest.raises(ValueError, match="is empty"):
+        extract_rules_from_existing_content("   ", "empty.txt", "txt", "apex-bank-01")
+
+
 # ============================================================================
 # 2. CIRCULAR EXTRACTION & DELTA ANALYSIS TESTS
 # ============================================================================

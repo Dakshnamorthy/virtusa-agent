@@ -160,10 +160,20 @@ def extract_rules_from_existing_content(
 ) -> list[RuleIR]:
     """
     Extracts structured Rule IR instances from uploaded bank rule documents
-    (JSON, YAML, SQL, or text/markdown).
+    (JSON, YAML, XML, SQL, PDF, DOCX, XLSX, or text/markdown).
+    Rejects unsupported file formats and ensures zero rule fabrication on failure.
     """
     rules: list[RuleIR] = []
-    fmt = file_format.lower().replace(".", "")
+    fmt = file_format.lower().replace(".", "").strip()
+
+    ALLOWED_FORMATS = {"json", "yaml", "yml", "xml", "sql", "pdf", "docx", "xlsx", "txt", "md", "csv"}
+    if fmt not in ALLOWED_FORMATS:
+        raise ValueError(
+            f"Unsupported file format '{fmt}'. Allowed formats are: {', '.join(sorted(ALLOWED_FORMATS))}."
+        )
+
+    if not content or not content.strip():
+        raise ValueError(f"Document '{filename}' is empty. No rules could be extracted.")
 
     # 1. Direct JSON extraction
     if fmt == "json":
@@ -181,8 +191,71 @@ def extract_rules_from_existing_content(
                     rules.append(normalize_to_rule_ir(item))
             if rules:
                 return rules
-        except Exception:
-            pass
+        except Exception as exc:
+            raise ValueError(f"Malformed JSON content in '{filename}': {exc}") from exc
+
+    # 2. YAML extraction
+    if fmt in ("yaml", "yml"):
+        try:
+            import yaml
+            parsed = yaml.safe_load(content)
+            items = parsed if isinstance(parsed, list) else [parsed]
+            for item in items:
+                if isinstance(item, dict):
+                    item["bank_id"] = bank_id
+                    item["source_type"] = "EXISTING_DOCUMENT"
+                    trace = item.get("traceability", {})
+                    trace["filename"] = filename
+                    trace["file_format"] = fmt
+                    item["traceability"] = trace
+                    rules.append(normalize_to_rule_ir(item))
+            if rules:
+                return rules
+        except Exception as exc:
+            raise ValueError(f"Malformed YAML content in '{filename}': {exc}") from exc
+
+    # 3. XML extraction
+    if fmt == "xml":
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(content)
+            rule_elems = root.findall(".//rule") if root.tag != "rule" else [root]
+            for idx, elem in enumerate(rule_elems):
+                r_id = elem.attrib.get("id") or elem.findtext("id") or f"XML-RULE-{idx + 1:03d}"
+                r_name = elem.findtext("name") or elem.attrib.get("name") or f"XML Rule {idx + 1}"
+                r_cat = elem.findtext("category") or elem.attrib.get("category") or "GENERAL"
+                r_desc = elem.findtext("description") or f"XML Rule from {filename}"
+                
+                conditions = []
+                for c_elem in elem.findall(".//condition"):
+                    f = c_elem.attrib.get("field") or c_elem.findtext("field")
+                    op = c_elem.attrib.get("operator") or c_elem.findtext("operator") or "eq"
+                    val = c_elem.attrib.get("value") or c_elem.findtext("value")
+                    if f and val is not None:
+                        try:
+                            v = float(val) if "." in val else int(val)
+                            vt = "numeric"
+                        except ValueError:
+                            v = val
+                            vt = "string"
+                        conditions.append(ConditionNode(field=f, operator=op, value=v, value_type=vt))
+                
+                rules.append(RuleIR(
+                    bank_id=bank_id,
+                    rule_id=r_id,
+                    rule_name=r_name,
+                    description=r_desc,
+                    category=r_cat.upper(),
+                    source_type="EXISTING_DOCUMENT",
+                    condition_tree=ConditionTree(operator="AND", conditions=conditions),
+                    actions=[ActionNode(action_type="FLAG_REVIEW", target="transaction")],
+                    traceability={"filename": filename, "file_format": "xml", "element_tag": elem.tag},
+                    raw_content=ET.tostring(elem, encoding="unicode"),
+                ))
+            if rules:
+                return rules
+        except Exception as exc:
+            raise ValueError(f"Malformed XML content in '{filename}': {exc}") from exc
 
     # 2. SQL Schema / Rules Extraction
     if fmt == "sql" or "create rule" in content.lower() or "where" in content.lower():
@@ -330,6 +403,9 @@ def extract_rules_from_existing_content(
             },
             raw_content=trimmed,
         ))
+
+    if not rules:
+        raise ValueError(f"Extraction failed: no compliance rules could be extracted from '{filename}'.")
 
     return rules
 

@@ -40,6 +40,7 @@ from cidan.services.rule_ir_service import (
     extract_rules_from_existing_content,
     normalize_to_rule_ir,
 )
+from cidan.services.persistence_service import BackendPersistence
 from cidan.services.rule_validation_service import (
     ValidationFinding,
     validate_rule_ir,
@@ -493,12 +494,8 @@ def extract_existing_rules_endpoint(
         bank_id=user.bank_id,
     )
     
-    # Cache in bank-scoped store
-    store = _BANK_RULE_IR_STORE.setdefault(user.bank_id, [])
-    for rule in extracted:
-        # Avoid duplicate rule_ids
-        if not any(r.rule_id == rule.rule_id for r in store):
-            store.append(rule)
+    # Persist in database with bank-level isolation
+    BackendPersistence.save_rules_ir(extracted, user.bank_id)
             
     return extracted
 
@@ -551,12 +548,11 @@ def get_rule_ir_catalog(
     source_type: str | None = None,
     user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> list[RuleIR]:
-    rules = _BANK_RULE_IR_STORE.get(user.bank_id, [])
-    if category:
-        rules = [r for r in rules if r.category.upper() == category.upper()]
-    if source_type:
-        rules = [r for r in rules if r.source_type.upper() == source_type.upper()]
-    return rules
+    return BackendPersistence.get_rules_ir(
+        bank_id=user.bank_id,
+        category=category,
+        source_type=source_type,
+    )
 
 
 @app.post(
@@ -577,7 +573,7 @@ def analyze_deltas_endpoint(
     if request.existing_rules:
         bank_existing = [normalize_to_rule_ir(r) for r in request.existing_rules]
     else:
-        bank_existing = _BANK_RULE_IR_STORE.get(user.bank_id, [])
+        bank_existing = BackendPersistence.get_rules_ir(user.bank_id)
 
     # If empty, extract default baseline rules for realistic banking evaluation
     if not bank_existing:
@@ -592,7 +588,7 @@ def analyze_deltas_endpoint(
             file_format="txt",
             bank_id=user.bank_id,
         )
-        _BANK_RULE_IR_STORE[user.bank_id] = list(bank_existing)
+        BackendPersistence.save_rules_ir(bank_existing, user.bank_id)
 
     # 2. Fetch or extract circular obligations
     obligations = request.circular_obligations or []
@@ -614,8 +610,8 @@ def analyze_deltas_endpoint(
         circular_number=request.circular_number,
     )
 
-    # Cache analysis result
-    _BANK_DELTA_ANALYSES_STORE.setdefault(user.bank_id, []).append(result)
+    # Persist analysis result in database
+    BackendPersistence.save_delta_analysis(result, user.bank_id)
 
     return result
 
@@ -629,7 +625,7 @@ def analyze_deltas_endpoint(
 def list_deltas_endpoint(
     user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> list[DeltaAnalysisResult]:
-    return _BANK_DELTA_ANALYSES_STORE.get(user.bank_id, [])
+    return BackendPersistence.get_delta_analyses(user.bank_id)
 
 
 @app.get(
@@ -642,12 +638,10 @@ def get_delta_item_endpoint(
     delta_id: str,
     user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> RuleDelta:
-    analyses = _BANK_DELTA_ANALYSES_STORE.get(user.bank_id, [])
-    for analysis in analyses:
-        for delta in analysis.deltas:
-            if delta.id == delta_id:
-                return delta
-    raise HTTPException(status_code=404, detail=f"Rule delta not found: {delta_id}")
+    delta = BackendPersistence.get_delta_item(delta_id, user.bank_id)
+    if not delta:
+        raise HTTPException(status_code=404, detail=f"Rule delta not found: {delta_id}")
+    return delta
 
 
 @app.post(
@@ -662,24 +656,6 @@ def save_mapping_endpoint(
     if request.bank_id and request.bank_id != user.bank_id:
         raise HTTPException(status_code=403, detail="Cross-bank access denied.")
 
-    # Update delta status in memory
-    analyses = _BANK_DELTA_ANALYSES_STORE.get(user.bank_id, [])
-    target_delta: RuleDelta | None = None
-    for analysis in analyses:
-        for delta in analysis.deltas:
-            if delta.id == request.delta_id:
-                target_delta = delta
-                status_map = {
-                    "ACCEPTED": "ACCEPTED",
-                    "MODIFIED": "MODIFIED",
-                    "REJECTED": "REJECTED",
-                    "MANUAL_REVIEW": "NEEDS_REVIEW",
-                }
-                delta.review_status = status_map.get(request.decision, "PENDING")
-                if request.customized_rule_ir:
-                    delta.proposed_change = request.customized_rule_ir
-                break
-
     mapping_record = {
         "mapping_id": str(uuid.uuid4()),
         "bank_id": user.bank_id,
@@ -689,13 +665,12 @@ def save_mapping_endpoint(
         "customized_rule_ir": request.customized_rule_ir,
         "user_notes": request.user_notes,
     }
-    _BANK_MAPPINGS_STORE.setdefault(user.bank_id, []).append(mapping_record)
+    BackendPersistence.save_mapping(mapping_record, user.bank_id)
 
     return {
         "status": "SUCCESS",
-        "message": f"Mapping decision '{request.decision}' successfully saved.",
+        "message": f"Mapping decision '{request.decision}' successfully saved to database.",
         "mapping": mapping_record,
-        "delta_updated": target_delta is not None,
     }
 
 
@@ -717,7 +692,7 @@ def validate_rule_endpoint(
         delta_id=request.delta_id,
         bank_id=user.bank_id,
     )
-    _BANK_VALIDATIONS_STORE.setdefault(user.bank_id, []).extend(findings)
+    BackendPersistence.save_validations(findings, user.bank_id)
     return findings
 
 
@@ -731,8 +706,5 @@ def get_validations_endpoint(
     delta_id: str | None = None,
     user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> list[ValidationFinding]:
-    findings = _BANK_VALIDATIONS_STORE.get(user.bank_id, [])
-    if delta_id:
-        findings = [f for f in findings if f.delta_id == delta_id]
-    return findings
+    return BackendPersistence.get_validations(user.bank_id, delta_id=delta_id)
 
