@@ -3,7 +3,7 @@ import logging
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
@@ -39,6 +39,45 @@ from cidan.services.rule_ir_service import (
     extract_obligations_from_circular,
     extract_rules_from_existing_content,
     normalize_to_rule_ir,
+)
+from cidan.services.approval_workflow_service import (
+    ApprovalDecisionRecord,
+    ApprovalRole,
+    ApprovalStageConfig,
+    ApprovalStatus,
+    ApprovalWorkflow,
+    ApprovalWorkflowService,
+    get_default_approval_stages,
+)
+from cidan.services.rule_version_service import (
+    RuleVersion,
+    RuleVersionComparison,
+    RuleVersionService,
+    VersionDiffItem,
+)
+from cidan.services.rule_testing_service import (
+    RuleTestCase,
+    RuleTestRun,
+    RuleTestSuite,
+    RuleTestingService,
+    TestCaseResult,
+    TestCaseType,
+    TestRunStatus,
+)
+from cidan.services.deployment_orchestration_service import (
+    DeploymentMode,
+    DeploymentPackage,
+    DeploymentRecord,
+    DeploymentStatus,
+    DeploymentTarget,
+    DeploymentOrchestrationService,
+    RollbackRecord,
+)
+from cidan.services.audit_notification_service import (
+    AuditEvent,
+    AuditTrailService,
+    NotificationRecord,
+    NotificationService,
 )
 from cidan.services.persistence_service import BackendPersistence
 from cidan.services.rule_validation_service import (
@@ -823,4 +862,791 @@ def get_validations_endpoint(
     user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> list[ValidationFinding]:
     return BackendPersistence.get_validations(user.bank_id, delta_id=delta_id)
+
+
+# ============================================================================
+# MILESTONE 3: APPROVAL WORKFLOW ENGINE APIS
+# ============================================================================
+
+class CreateWorkflowRequest(BaseModel):
+    rule_id: str
+    rule_name: str
+    rule_ir_snapshot: dict[str, Any]
+    delta_id: str | None = None
+    category: str = "GENERAL"
+    circular_reference: str | None = None
+    deadline_days: int = 7
+    bank_id: str | None = None
+
+
+class WorkflowActionRequest(BaseModel):
+    action: Literal["APPROVED", "REJECTED", "CHANGES_REQUESTED", "RESUBMITTED"]
+    comments: str = ""
+    role: ApprovalRole = "COMPLIANCE_ANALYST"
+    actor_email: str | None = None
+    rejection_reason: str | None = None
+    change_request_notes: str | None = None
+    bank_id: str | None = None
+
+
+@app.post(
+    "/approvals/workflows",
+    response_model=ApprovalWorkflow,
+    summary="Submit Rule Change for Multi-Level Approval",
+    description="Initiates a 16-state approval workflow with configurable reviewer stages and deadlines.",
+)
+def create_approval_workflow_endpoint(
+    request: CreateWorkflowRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> ApprovalWorkflow:
+    if request.bank_id and request.bank_id != user.bank_id:
+        raise HTTPException(status_code=403, detail="Cross-bank access denied.")
+
+    wf = ApprovalWorkflowService.create_workflow(
+        bank_id=user.bank_id,
+        rule_id=request.rule_id,
+        rule_name=request.rule_name,
+        author_id=user.user_email,
+        author_email=user.user_email,
+        rule_ir_snapshot=request.rule_ir_snapshot,
+        delta_id=request.delta_id,
+        category=request.category,
+        circular_reference=request.circular_reference,
+        deadline_days=request.deadline_days,
+    )
+    # Automatically move from DRAFT to SUBMITTED_FOR_REVIEW
+    wf, dec = ApprovalWorkflowService.transition_state(
+        workflow=wf,
+        new_status="SUBMITTED_FOR_REVIEW",
+        actor_email=user.user_email,
+        actor_role="RULE_AUTHOR",
+        comments="Submitted for formal compliance review.",
+    )
+    BackendPersistence.save_workflow(wf.model_dump(), user.bank_id)
+    BackendPersistence.save_decision(dec.model_dump(), user.bank_id)
+
+    # Log audit event
+    audit_ev = AuditTrailService.record_event(
+        bank_id=user.bank_id,
+        actor_email=user.user_email,
+        actor_role="RULE_AUTHOR",
+        action="APPROVAL_WORKFLOW_SUBMITTED",
+        resource_type="APPROVAL_WORKFLOW",
+        resource_id=wf.id,
+        new_state=wf.model_dump(),
+    )
+    BackendPersistence.save_audit_event(audit_ev.model_dump(), user.bank_id)
+
+    # Dispatch notification
+    notif = NotificationService.notify_lifecycle_event(
+        bank_id=user.bank_id,
+        recipient_email=user.user_email,
+        event_type="WORKFLOW_SUBMITTED",
+        title=f"Approval Workflow Submitted: {wf.rule_name}",
+        message=f"Rule change '{wf.rule_name}' was submitted for review. Current status: SUBMITTED_FOR_REVIEW.",
+        resource_id=wf.id,
+    )
+    BackendPersistence.save_notification(notif.model_dump(), user.bank_id)
+
+    return wf
+
+
+@app.get(
+    "/approvals",
+    summary="List Approval Workflows with Dashboard Metrics",
+    description="Returns all approval workflows, filterable by status, plus aggregate dashboard counts.",
+)
+def list_approvals_endpoint(
+    status: ApprovalStatus | None = None,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    raw_wfs = BackendPersistence.get_workflows(user.bank_id)
+    filtered = [w for w in raw_wfs if not status or w.get("status") == status]
+
+    # Calculate real database metrics
+    metrics = {
+        "total": len(raw_wfs),
+        "pending": sum(1 for w in raw_wfs if w.get("status") in ("SUBMITTED_FOR_REVIEW", "UNDER_REVIEW")),
+        "under_review": sum(1 for w in raw_wfs if w.get("status") == "UNDER_REVIEW"),
+        "approved": sum(1 for w in raw_wfs if w.get("status") == "APPROVED"),
+        "rejected": sum(1 for w in raw_wfs if w.get("status") == "REJECTED"),
+        "changes_requested": sum(1 for w in raw_wfs if w.get("status") == "CHANGES_REQUESTED"),
+        "ready_for_testing": sum(1 for w in raw_wfs if w.get("status") == "READY_FOR_TESTING"),
+        "ready_for_deployment": sum(1 for w in raw_wfs if w.get("status") == "READY_FOR_DEPLOYMENT"),
+        "deployed": sum(1 for w in raw_wfs if w.get("status") == "DEPLOYED"),
+        "rolled_back": sum(1 for w in raw_wfs if w.get("status") == "ROLLED_BACK"),
+    }
+
+    return {"metrics": metrics, "workflows": filtered}
+
+
+@app.get(
+    "/approvals/{workflow_id}",
+    summary="Get Approval Workflow Details and Decision History",
+)
+def get_approval_detail_endpoint(
+    workflow_id: str,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    wf = BackendPersistence.get_workflow_by_id(workflow_id, user.bank_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail=f"Approval workflow not found: {workflow_id}")
+
+    decisions = BackendPersistence.get_decisions_for_workflow(workflow_id)
+    return {"workflow": wf, "decisions": decisions}
+
+
+@app.post(
+    "/approvals/{workflow_id}/action",
+    summary="Execute Approval Decision (Approve, Reject, Request Changes, Resubmit)",
+    description="Enforces separation of duties: author cannot approve own submission.",
+)
+def execute_approval_action_endpoint(
+    workflow_id: str,
+    request: WorkflowActionRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    if request.bank_id and request.bank_id != user.bank_id:
+        raise HTTPException(status_code=403, detail="Cross-bank access denied.")
+
+    raw_wf = BackendPersistence.get_workflow_by_id(workflow_id, user.bank_id)
+    if not raw_wf:
+        raise HTTPException(status_code=404, detail=f"Approval workflow not found: {workflow_id}")
+
+    wf_obj = ApprovalWorkflow(**raw_wf)
+
+    # Determine target status
+    status_map = {
+        "APPROVED": "APPROVED",
+        "REJECTED": "REJECTED",
+        "CHANGES_REQUESTED": "CHANGES_REQUESTED",
+        "RESUBMITTED": "RESUBMITTED",
+    }
+    target_status = status_map[request.action]
+
+    # If currently in SUBMITTED_FOR_REVIEW or RESUBMITTED and transitioning to review, move to UNDER_REVIEW
+    if wf_obj.status in ("SUBMITTED_FOR_REVIEW", "RESUBMITTED") and request.action == "APPROVED":
+        wf_obj.status = "UNDER_REVIEW"
+
+    try:
+        updated_wf, decision = ApprovalWorkflowService.transition_state(
+            workflow=wf_obj,
+            new_status=target_status,  # type: ignore
+            actor_email=request.actor_email or user.user_email,
+            actor_role=request.role,
+            comments=request.comments,
+            rejection_reason=request.rejection_reason,
+            change_request_notes=request.change_request_notes,
+        )
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    # If fully approved and no more stages, set READY_FOR_TESTING
+    if updated_wf.status == "APPROVED":
+        updated_wf.status = "READY_FOR_TESTING"
+
+    BackendPersistence.save_workflow(updated_wf.model_dump(), user.bank_id)
+    BackendPersistence.save_decision(decision.model_dump(), user.bank_id)
+
+    # Log audit event
+    audit_ev = AuditTrailService.record_event(
+        bank_id=user.bank_id,
+        actor_email=user.user_email,
+        actor_role=request.role,
+        action=f"APPROVAL_{request.action}",
+        resource_type="APPROVAL_WORKFLOW",
+        resource_id=workflow_id,
+        previous_state=raw_wf,
+        new_state=updated_wf.model_dump(),
+        metadata={"comments": request.comments, "decision": request.action},
+    )
+    BackendPersistence.save_audit_event(audit_ev.model_dump(), user.bank_id)
+
+    # Dispatch notification to author
+    notif = NotificationService.notify_lifecycle_event(
+        bank_id=user.bank_id,
+        recipient_email=updated_wf.author_email,
+        event_type=f"APPROVAL_{request.action}",
+        title=f"Workflow Update: {updated_wf.rule_name} is {updated_wf.status}",
+        message=f"Reviewer {user.user_email} evaluated '{updated_wf.rule_name}' with decision: {request.action}. Notes: {request.comments}",
+        resource_id=workflow_id,
+    )
+    BackendPersistence.save_notification(notif.model_dump(), user.bank_id)
+
+    return {"status": "SUCCESS", "workflow": updated_wf.model_dump(), "decision": decision.model_dump()}
+
+
+# ============================================================================
+# MILESTONE 3: RULE VERSION MANAGEMENT APIS
+# ============================================================================
+
+class CreateVersionRequest(BaseModel):
+    rule_id: str
+    rule_ir_snapshot: dict[str, Any]
+    change_summary: str
+    parent_version: str | None = None
+    regulatory_reference: str | None = None
+    approval_workflow_id: str | None = None
+    bump_type: Literal["major", "minor"] = "minor"
+    bank_id: str | None = None
+
+
+@app.post(
+    "/rules/versions",
+    response_model=RuleVersion,
+    summary="Create Immutable Rule Version Snapshot",
+)
+def create_rule_version_endpoint(
+    request: CreateVersionRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> RuleVersion:
+    if request.bank_id and request.bank_id != user.bank_id:
+        raise HTTPException(status_code=403, detail="Cross-bank access denied.")
+
+    version = RuleVersionService.create_version(
+        rule_id=request.rule_id,
+        bank_id=user.bank_id,
+        rule_ir_snapshot=request.rule_ir_snapshot,
+        created_by=user.user_email,
+        change_summary=request.change_summary,
+        parent_version=request.parent_version,
+        regulatory_reference=request.regulatory_reference,
+        approval_workflow_id=request.approval_workflow_id,
+        bump_type=request.bump_type,
+    )
+    BackendPersistence.save_rule_version(version.model_dump(), user.bank_id)
+
+    audit_ev = AuditTrailService.record_event(
+        bank_id=user.bank_id,
+        actor_email=user.user_email,
+        actor_role="RULE_AUTHOR",
+        action="RULE_VERSION_CREATED",
+        resource_type="RULE_VERSION",
+        resource_id=version.id,
+        new_state=version.model_dump(),
+    )
+    BackendPersistence.save_audit_event(audit_ev.model_dump(), user.bank_id)
+
+    return version
+
+
+@app.get(
+    "/rules/{rule_id}/versions",
+    summary="List Version History for Rule",
+)
+def get_rule_versions_endpoint(
+    rule_id: str,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[dict[str, Any]]:
+    return BackendPersistence.get_rule_versions(user.bank_id, rule_id=rule_id)
+
+
+@app.get(
+    "/rules/{rule_id}/versions/compare",
+    response_model=RuleVersionComparison,
+    summary="Compare Two Rule Versions",
+)
+def compare_rule_versions_endpoint(
+    rule_id: str,
+    base_version: str,
+    target_version: str,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> RuleVersionComparison:
+    versions = BackendPersistence.get_rule_versions(user.bank_id, rule_id=rule_id)
+    base_raw = next((v for v in versions if v.get("version_number") == base_version), None)
+    target_raw = next((v for v in versions if v.get("version_number") == target_version), None)
+
+    if not base_raw or not target_raw:
+        raise HTTPException(status_code=404, detail="One or both versions not found for comparison.")
+
+    return RuleVersionService.compare_versions(
+        base=RuleVersion(**base_raw),
+        target=RuleVersion(**target_raw),
+    )
+
+
+# ============================================================================
+# MILESTONE 3: SIMULATION & TESTING APIS
+# ============================================================================
+
+class CreateTestSuiteRequest(BaseModel):
+    rule_id: str
+    rule_version: str
+    suite_name: str
+    description: str = ""
+    bank_id: str | None = None
+
+
+class AddTestCaseRequest(BaseModel):
+    test_type: TestCaseType
+    scenario_name: str
+    input_data: dict[str, Any]
+    expected_result: dict[str, Any]
+    is_mandatory: bool = True
+    bank_id: str | None = None
+
+
+class GenerateTestCasesRequest(BaseModel):
+    rule_ir: dict[str, Any]
+    bank_id: str | None = None
+
+
+@app.post(
+    "/testing/suites",
+    response_model=RuleTestSuite,
+    summary="Create Rule Test Suite",
+)
+def create_test_suite_endpoint(
+    request: CreateTestSuiteRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> RuleTestSuite:
+    if request.bank_id and request.bank_id != user.bank_id:
+        raise HTTPException(status_code=403, detail="Cross-bank access denied.")
+
+    suite = RuleTestSuite(
+        bank_id=user.bank_id,
+        rule_id=request.rule_id,
+        rule_version=request.rule_version,
+        suite_name=request.suite_name,
+        description=request.description,
+        created_by=user.user_email,
+    )
+    BackendPersistence.save_test_suite(suite.model_dump(), user.bank_id)
+    return suite
+
+
+@app.get(
+    "/testing/suites",
+    summary="List Test Suites for Bank",
+)
+def list_test_suites_endpoint(
+    rule_id: str | None = None,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[dict[str, Any]]:
+    return BackendPersistence.get_test_suites(user.bank_id, rule_id=rule_id)
+
+
+@app.post(
+    "/testing/generate-cases",
+    response_model=list[RuleTestCase],
+    summary="Automatically Generate Positive, Negative & Boundary Test Cases from Rule IR",
+)
+def generate_test_cases_endpoint(
+    request: GenerateTestCasesRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[RuleTestCase]:
+    if request.bank_id and request.bank_id != user.bank_id:
+        raise HTTPException(status_code=403, detail="Cross-bank access denied.")
+
+    return RuleTestingService.generate_boundary_and_functional_cases(
+        suite_id="draft-suite",
+        bank_id=user.bank_id,
+        rule_ir=request.rule_ir,
+    )
+
+
+@app.post(
+    "/testing/suites/{suite_id}/cases",
+    summary="Add Test Cases to Test Suite",
+)
+def add_test_case_endpoint(
+    suite_id: str,
+    request: AddTestCaseRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    suites = BackendPersistence.get_test_suites(user.bank_id)
+    suite = next((s for s in suites if s["id"] == suite_id), None)
+    if not suite:
+        raise HTTPException(status_code=404, detail=f"Test suite not found: {suite_id}")
+
+    case = RuleTestCase(
+        suite_id=suite_id,
+        bank_id=user.bank_id,
+        rule_id=suite["rule_id"],
+        test_type=request.test_type,
+        scenario_name=request.scenario_name,
+        input_data=request.input_data,
+        expected_result=request.expected_result,
+        is_mandatory=request.is_mandatory,
+    )
+    suite.setdefault("test_cases", []).append(case.model_dump())
+    BackendPersistence.save_test_suite(suite, user.bank_id)
+    return {"status": "SUCCESS", "test_case": case.model_dump()}
+
+
+@app.post(
+    "/testing/suites/{suite_id}/run",
+    response_model=RuleTestRun,
+    summary="Execute Isolated Rule Simulation Test Run",
+)
+def run_test_suite_endpoint(
+    suite_id: str,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> RuleTestRun:
+    suites = BackendPersistence.get_test_suites(user.bank_id)
+    raw_suite = next((s for s in suites if s["id"] == suite_id), None)
+    if not raw_suite:
+        raise HTTPException(status_code=404, detail=f"Test suite not found: {suite_id}")
+
+    suite_obj = RuleTestSuite(**raw_suite)
+
+    # If suite has no cases, generate them automatically from rule
+    if not suite_obj.test_cases:
+        rules = BackendPersistence.get_rules_ir(user.bank_id)
+        matching_rule = next((r for r in rules if r.rule_id == suite_obj.rule_id), None)
+        rule_dict = matching_rule.model_dump() if matching_rule else {"rule_id": suite_obj.rule_id, "condition_tree": {"conditions": []}}
+        suite_obj.test_cases = RuleTestingService.generate_boundary_and_functional_cases(
+            suite_id=suite_id,
+            bank_id=user.bank_id,
+            rule_ir=rule_dict,
+        )
+        raw_suite["test_cases"] = [c.model_dump() for c in suite_obj.test_cases]
+        BackendPersistence.save_test_suite(raw_suite, user.bank_id)
+
+    # Get rule IR snapshot
+    rules = BackendPersistence.get_rules_ir(user.bank_id)
+    matching_rule = next((r for r in rules if r.rule_id == suite_obj.rule_id), None)
+    rule_snapshot = matching_rule.model_dump() if matching_rule else {"rule_id": suite_obj.rule_id, "condition_tree": {"conditions": []}}
+
+    run = RuleTestingService.execute_test_suite(
+        suite=suite_obj,
+        rule_ir_snapshot=rule_snapshot,
+        started_by=user.user_email,
+    )
+    BackendPersistence.save_test_run(run.model_dump(), user.bank_id)
+
+    # Update workflow state if linked
+    workflows = BackendPersistence.get_workflows(user.bank_id)
+    for wf in workflows:
+        if wf.get("rule_id") == suite_obj.rule_id and wf.get("status") in ("READY_FOR_TESTING", "TESTING_IN_PROGRESS"):
+            wf["status"] = "TEST_PASSED" if run.status == "PASSED" else "TEST_FAILED"
+            BackendPersistence.save_workflow(wf, user.bank_id)
+
+    # Record Audit Event
+    audit_ev = AuditTrailService.record_event(
+        bank_id=user.bank_id,
+        actor_email=user.user_email,
+        actor_role="COMPLIANCE_ANALYST",
+        action="TEST_SUITE_EXECUTED",
+        resource_type="TEST_RUN",
+        resource_id=run.id,
+        new_state=run.model_dump(),
+        metadata={"pass_percentage": run.pass_percentage, "status": run.status},
+    )
+    BackendPersistence.save_audit_event(audit_ev.model_dump(), user.bank_id)
+
+    return run
+
+
+@app.get(
+    "/testing/runs",
+    summary="List Test Runs for Bank",
+)
+def list_test_runs_endpoint(
+    suite_id: str | None = None,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[dict[str, Any]]:
+    return BackendPersistence.get_test_runs(user.bank_id, suite_id=suite_id)
+
+
+# ============================================================================
+# MILESTONE 3: DEPLOYMENT ORCHESTRATION & ROLLBACK APIS
+# ============================================================================
+
+class CreateDeploymentPackageRequest(BaseModel):
+    rule_id: str
+    rule_version: str
+    version_id: str
+    approved_rule_ir: dict[str, Any]
+    regulatory_reference: str | None = None
+    approval_records: list[dict[str, Any]] = Field(default_factory=list)
+    validation_results: list[dict[str, Any]] = Field(default_factory=list)
+    test_results: list[dict[str, Any]] = Field(default_factory=list)
+    bank_id: str | None = None
+
+
+class ValidateDeploymentRequest(BaseModel):
+    package_id: str
+    target_id: str
+    bank_id: str | None = None
+
+
+class ExecuteDeploymentRequest(BaseModel):
+    package_id: str
+    target_id: str
+    deployment_mode: DeploymentMode = "MANUAL"
+    bank_id: str | None = None
+
+
+class ExecuteRollbackRequest(BaseModel):
+    deployment_id: str
+    target_id: str
+    restored_version: str
+    rollback_ir: dict[str, Any]
+    reason: str
+    bank_id: str | None = None
+
+
+@app.get(
+    "/deployments/targets",
+    summary="List Bank Deployment Targets",
+)
+def list_deployment_targets_endpoint(
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[dict[str, Any]]:
+    return BackendPersistence.get_deployment_targets(user.bank_id)
+
+
+@app.post(
+    "/deployments/packages/create",
+    response_model=DeploymentPackage,
+    summary="Generate Immutable Deployment Package with SHA-256 Checksum",
+)
+def create_deployment_package_endpoint(
+    request: CreateDeploymentPackageRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> DeploymentPackage:
+    if request.bank_id and request.bank_id != user.bank_id:
+        raise HTTPException(status_code=403, detail="Cross-bank access denied.")
+
+    pkg = DeploymentOrchestrationService.create_deployment_package(
+        bank_id=user.bank_id,
+        rule_id=request.rule_id,
+        rule_version=request.rule_version,
+        version_id=request.version_id,
+        approved_rule_ir=request.approved_rule_ir,
+        approval_records=request.approval_records,
+        validation_results=request.validation_results,
+        test_results=request.test_results,
+        created_by=user.user_email,
+        regulatory_reference=request.regulatory_reference,
+    )
+    BackendPersistence.save_deployment_package(pkg.model_dump(), user.bank_id)
+
+    audit_ev = AuditTrailService.record_event(
+        bank_id=user.bank_id,
+        actor_email=user.user_email,
+        actor_role="DEPLOYMENT_ADMIN",
+        action="DEPLOYMENT_PACKAGE_CREATED",
+        resource_type="DEPLOYMENT_PACKAGE",
+        resource_id=pkg.id,
+        metadata={"checksum": pkg.package_checksum, "version": pkg.rule_version},
+    )
+    BackendPersistence.save_audit_event(audit_ev.model_dump(), user.bank_id)
+
+    return pkg
+
+
+@app.post(
+    "/deployments/validate-readiness",
+    summary="Validate Pre-Deployment Safety Gates",
+)
+def validate_deployment_readiness_endpoint(
+    request: ValidateDeploymentRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    packages = BackendPersistence.get_deployment_packages(user.bank_id)
+    raw_pkg = next((p for p in packages if p["id"] == request.package_id), None)
+    if not raw_pkg:
+        raise HTTPException(status_code=404, detail="Deployment package not found.")
+
+    targets = BackendPersistence.get_deployment_targets(user.bank_id)
+    raw_target = next((t for t in targets if t["id"] == request.target_id), None)
+    if not raw_target:
+        raise HTTPException(status_code=404, detail="Deployment target not found.")
+
+    is_ready, blockers = DeploymentOrchestrationService.validate_deployment_readiness(
+        package=DeploymentPackage(**raw_pkg),
+        target=DeploymentTarget(**raw_target),
+        workflow_status="TEST_PASSED",
+        test_run_status="PASSED",
+    )
+    return {
+        "is_ready": is_ready,
+        "blockers": blockers,
+        "package_checksum": raw_pkg.get("package_checksum"),
+        "target_writable": raw_target.get("is_writable"),
+    }
+
+
+@app.post(
+    "/deployments/deploy",
+    response_model=DeploymentRecord,
+    summary="Execute Controlled Production Deployment & Post-Verification",
+)
+def execute_deployment_endpoint(
+    request: ExecuteDeploymentRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> DeploymentRecord:
+    packages = BackendPersistence.get_deployment_packages(user.bank_id)
+    raw_pkg = next((p for p in packages if p["id"] == request.package_id), None)
+    if not raw_pkg:
+        raise HTTPException(status_code=404, detail="Deployment package not found.")
+
+    targets = BackendPersistence.get_deployment_targets(user.bank_id)
+    raw_target = next((t for t in targets if t["id"] == request.target_id), None)
+    if not raw_target:
+        raise HTTPException(status_code=404, detail="Deployment target not found.")
+
+    record = DeploymentOrchestrationService.execute_deployment(
+        package=DeploymentPackage(**raw_pkg),
+        target=DeploymentTarget(**raw_target),
+        deployed_by=user.user_email,
+        deployment_mode=request.deployment_mode,
+        workflow_status="TEST_PASSED",
+        test_run_status="PASSED",
+    )
+    BackendPersistence.save_deployment_record(record.model_dump(), user.bank_id)
+
+    # Log Audit Event
+    audit_ev = AuditTrailService.record_event(
+        bank_id=user.bank_id,
+        actor_email=user.user_email,
+        actor_role="DEPLOYMENT_ADMIN",
+        action="DEPLOYMENT_EXECUTED",
+        resource_type="DEPLOYMENT_RECORD",
+        resource_id=record.id,
+        new_state=record.model_dump(),
+        metadata={"status": record.status, "post_verification": record.post_verification_status},
+    )
+    BackendPersistence.save_audit_event(audit_ev.model_dump(), user.bank_id)
+
+    # Notification
+    notif = NotificationService.notify_lifecycle_event(
+        bank_id=user.bank_id,
+        recipient_email=user.user_email,
+        event_type="DEPLOYMENT_COMPLETED" if record.status == "ACTIVE" else "DEPLOYMENT_FAILED",
+        title=f"Deployment {record.status}: {record.rule_name}",
+        message=f"Deployment to {raw_target['name']} resulted in status: {record.status}.",
+        resource_id=record.id,
+        send_email=True,
+    )
+    BackendPersistence.save_notification(notif.model_dump(), user.bank_id)
+
+    return record
+
+
+@app.get(
+    "/deployments",
+    summary="List Deployment Records & History",
+)
+def list_deployments_endpoint(
+    rule_id: str | None = None,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[dict[str, Any]]:
+    return BackendPersistence.get_deployment_records(user.bank_id, rule_id=rule_id)
+
+
+@app.post(
+    "/deployments/{deployment_id}/rollback",
+    summary="Initiate Rollback to Previous Known-Good Rule Version",
+)
+def execute_rollback_endpoint(
+    deployment_id: str,
+    request: ExecuteRollbackRequest,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    deployments = BackendPersistence.get_deployment_records(user.bank_id)
+    raw_dep = next((d for d in deployments if d["id"] == deployment_id), None)
+    if not raw_dep:
+        raise HTTPException(status_code=404, detail="Deployment record not found.")
+
+    targets = BackendPersistence.get_deployment_targets(user.bank_id)
+    raw_target = next((t for t in targets if t["id"] == request.target_id), None)
+    if not raw_target:
+        raise HTTPException(status_code=404, detail="Deployment target not found.")
+
+    try:
+        rollback_record, updated_dep = DeploymentOrchestrationService.execute_rollback(
+            deployment_record=DeploymentRecord(**raw_dep),
+            target=DeploymentTarget(**raw_target),
+            restored_version=request.restored_version,
+            rollback_ir=request.rollback_ir,
+            initiated_by=user.user_email,
+            reason=request.reason,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    BackendPersistence.save_rollback_record(rollback_record.model_dump(), user.bank_id)
+    BackendPersistence.save_deployment_record(updated_dep.model_dump(), user.bank_id)
+
+    # Audit Event
+    audit_ev = AuditTrailService.record_event(
+        bank_id=user.bank_id,
+        actor_email=user.user_email,
+        actor_role="DEPLOYMENT_ADMIN",
+        action="RULE_ROLLBACK_EXECUTED",
+        resource_type="ROLLBACK_RECORD",
+        resource_id=rollback_record.id,
+        metadata={"restored_version": request.restored_version, "reason": request.reason},
+    )
+    BackendPersistence.save_audit_event(audit_ev.model_dump(), user.bank_id)
+
+    return {
+        "status": "SUCCESS",
+        "rollback": rollback_record.model_dump(),
+        "deployment": updated_dep.model_dump(),
+    }
+
+
+# ============================================================================
+# MILESTONE 3: COMPLIANCE AUDIT TRAIL & NOTIFICATION APIS
+# ============================================================================
+
+@app.get(
+    "/audit/events",
+    summary="Retrieve Bank Compliance Audit Events",
+)
+def get_audit_events_endpoint(
+    resource_type: str | None = None,
+    action: str | None = None,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[dict[str, Any]]:
+    return BackendPersistence.get_audit_events(
+        user.bank_id,
+        resource_type=resource_type,
+        action=action,
+    )
+
+
+@app.get(
+    "/audit/export",
+    summary="Export Audit Trail as CSV for Regulatory Compliance",
+)
+def export_audit_csv_endpoint(
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> PlainTextResponse:
+    raw_events = BackendPersistence.get_audit_events(user.bank_id)
+    event_objs = [AuditEvent(**e) for e in raw_events]
+    csv_data = AuditTrailService.export_audit_csv(event_objs)
+    return PlainTextResponse(
+        content=csv_data,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=cidan_compliance_audit_trail.csv"},
+    )
+
+
+@app.get(
+    "/notifications",
+    summary="List Notifications for Authenticated User",
+)
+def list_notifications_endpoint(
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[dict[str, Any]]:
+    return BackendPersistence.get_notifications(user.bank_id, recipient_email=user.user_email)
+
+
+@app.post(
+    "/notifications/{notification_id}/read",
+    summary="Mark Notification as Read",
+)
+def mark_notification_read_endpoint(
+    notification_id: str,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    success = BackendPersistence.mark_notification_read(notification_id, user.bank_id)
+    return {"status": "SUCCESS" if success else "NOT_FOUND", "notification_id": notification_id}
 

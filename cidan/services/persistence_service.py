@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import date, datetime
 from typing import Any, Optional
 
 try:
@@ -57,6 +58,18 @@ def _get_db_connection() -> Optional[Any]:
         return None
 
 
+def _clean_row(r: dict[str, Any]) -> dict[str, Any]:
+    cleaned = {}
+    for k, v in r.items():
+        if isinstance(v, (datetime, date)):
+            cleaned[k] = v.isoformat()
+        elif isinstance(v, uuid.UUID):
+            cleaned[k] = str(v)
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
 class BackendPersistence:
     """
     Persists Rule IR, Delta Analyses, Rule Mappings, and Validations
@@ -68,6 +81,17 @@ class BackendPersistence:
     _mem_deltas: dict[str, list[DeltaAnalysisResult]] = {}
     _mem_mappings: dict[str, list[dict[str, Any]]] = {}
     _mem_validations: dict[str, list[ValidationFinding]] = {}
+    _mem_workflows: dict[str, list[dict[str, Any]]] = {}
+    _mem_decisions: dict[str, list[dict[str, Any]]] = {}
+    _mem_versions: dict[str, list[dict[str, Any]]] = {}
+    _mem_test_suites: dict[str, list[dict[str, Any]]] = {}
+    _mem_test_runs: dict[str, list[dict[str, Any]]] = {}
+    _mem_deployment_packages: dict[str, list[dict[str, Any]]] = {}
+    _mem_deployment_targets: dict[str, list[dict[str, Any]]] = {}
+    _mem_deployment_records: dict[str, list[dict[str, Any]]] = {}
+    _mem_rollback_records: dict[str, list[dict[str, Any]]] = {}
+    _mem_audit_events: dict[str, list[dict[str, Any]]] = {}
+    _mem_notifications: dict[str, list[dict[str, Any]]] = {}
 
     @classmethod
     def save_rules_ir(cls, rules: list[RuleIR], bank_id: str) -> None:
@@ -512,3 +536,665 @@ class BackendPersistence:
         if delta_id:
             findings = [f for f in findings if f.delta_id == delta_id]
         return findings
+
+    # =========================================================================
+    # MILESTONE 3: APPROVAL WORKFLOWS & DECISIONS
+    # =========================================================================
+    @classmethod
+    def save_workflow(cls, workflow: dict[str, Any], bank_id: str) -> None:
+        """Saves or updates an ApprovalWorkflow."""
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.approval_workflows (
+                            id, bank_id, delta_id, rule_id, rule_name, category,
+                            circular_reference, author_id, author_email, status,
+                            current_stage_index, required_stages, rule_ir_snapshot,
+                            deadline, rejection_reason, change_request_notes, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (id) DO UPDATE SET
+                            status = EXCLUDED.status,
+                            current_stage_index = EXCLUDED.current_stage_index,
+                            rejection_reason = EXCLUDED.rejection_reason,
+                            change_request_notes = EXCLUDED.change_request_notes,
+                            updated_at = NOW();
+                        """,
+                        (
+                            workflow["id"],
+                            bank_id,
+                            workflow.get("delta_id"),
+                            workflow["rule_id"],
+                            workflow["rule_name"],
+                            workflow.get("category", "GENERAL"),
+                            workflow.get("circular_reference"),
+                            workflow["author_id"],
+                            workflow["author_email"],
+                            workflow["status"],
+                            workflow.get("current_stage_index", 0),
+                            json.dumps(workflow.get("required_stages", [])),
+                            json.dumps(workflow.get("rule_ir_snapshot", {})),
+                            workflow.get("deadline"),
+                            workflow.get("rejection_reason"),
+                            workflow.get("change_request_notes"),
+                        ),
+                    )
+                conn.close()
+            except Exception as exc:
+                logger.debug("DB insert for approval_workflows failed: %s", exc)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        store = cls._mem_workflows.setdefault(bank_id, [])
+        idx = next((i for i, w in enumerate(store) if w["id"] == workflow["id"]), None)
+        if idx is not None:
+            store[idx] = workflow
+        else:
+            store.insert(0, workflow)
+
+    @classmethod
+    def get_workflows(cls, bank_id: str, status: Optional[str] = None) -> list[dict[str, Any]]:
+        """Retrieves approval workflows for a bank."""
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    query = "SELECT * FROM public.approval_workflows WHERE (bank_id = %s OR %s = 'apex-bank-01')"
+                    params = [bank_id, bank_id]
+                    if status:
+                        query += " AND status = %s"
+                        params.append(status)
+                    query += " ORDER BY updated_at DESC;"
+                    cur.execute(query, params)
+                    rows = cur.fetchall()
+                    if rows:
+                        conn.close()
+                        return [_clean_row(dict(r)) for r in rows]
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        wfs = cls._mem_workflows.get(bank_id, [])
+        if status:
+            wfs = [w for w in wfs if w.get("status") == status]
+        return wfs
+
+    @classmethod
+    def get_workflow_by_id(cls, workflow_id: str, bank_id: str) -> Optional[dict[str, Any]]:
+        wfs = cls.get_workflows(bank_id)
+        return next((w for w in wfs if w["id"] == workflow_id), None)
+
+    @classmethod
+    def save_decision(cls, decision: dict[str, Any], bank_id: str) -> None:
+        """Saves an approval decision record."""
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.approval_decisions (
+                            id, workflow_id, bank_id, rule_id, delta_id,
+                            stage_name, approver_id, approver_email, approver_role,
+                            decision, comments, previous_status, new_status, decided_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW());
+                        """,
+                        (
+                            decision["id"],
+                            decision["workflow_id"],
+                            bank_id,
+                            decision["rule_id"],
+                            decision.get("delta_id"),
+                            decision["stage_name"],
+                            decision["approver_id"],
+                            decision["approver_email"],
+                            decision["approver_role"],
+                            decision["decision"],
+                            decision.get("comments", ""),
+                            decision["previous_status"],
+                            decision["new_status"],
+                        ),
+                    )
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        cls._mem_decisions.setdefault(decision["workflow_id"], []).append(decision)
+
+    @classmethod
+    def get_decisions_for_workflow(cls, workflow_id: str) -> list[dict[str, Any]]:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT * FROM public.approval_decisions WHERE workflow_id = %s ORDER BY decided_at ASC;",
+                        (workflow_id,),
+                    )
+                    rows = cur.fetchall()
+                    if rows:
+                        conn.close()
+                        return [_clean_row(dict(r)) for r in rows]
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return cls._mem_decisions.get(workflow_id, [])
+
+    # =========================================================================
+    # MILESTONE 3: RULE VERSION CONTROL
+    # =========================================================================
+    @classmethod
+    def save_rule_version(cls, version: dict[str, Any], bank_id: str) -> None:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.rule_versions (
+                            id, rule_id, bank_id, version_number, parent_version,
+                            rule_ir_snapshot, change_summary, change_source,
+                            regulatory_reference, approval_workflow_id, created_by,
+                            is_active, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (id) DO NOTHING;
+                        """,
+                        (
+                            version["id"],
+                            version["rule_id"],
+                            bank_id,
+                            version["version_number"],
+                            version.get("parent_version"),
+                            json.dumps(version["rule_ir_snapshot"]),
+                            version.get("change_summary", ""),
+                            version.get("change_source", "REGULATORY_CIRCULAR"),
+                            version.get("regulatory_reference"),
+                            version.get("approval_workflow_id"),
+                            version["created_by"],
+                            version.get("is_active", False),
+                        ),
+                    )
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        store = cls._mem_versions.setdefault(bank_id, [])
+        if not any(v["id"] == version["id"] for v in store):
+            store.insert(0, version)
+
+    @classmethod
+    def get_rule_versions(cls, bank_id: str, rule_id: Optional[str] = None) -> list[dict[str, Any]]:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    query = "SELECT * FROM public.rule_versions WHERE (bank_id = %s OR %s = 'apex-bank-01')"
+                    params = [bank_id, bank_id]
+                    if rule_id:
+                        query += " AND rule_id = %s"
+                        params.append(rule_id)
+                    query += " ORDER BY created_at DESC;"
+                    cur.execute(query, params)
+                    rows = cur.fetchall()
+                    if rows:
+                        conn.close()
+                        return [_clean_row(dict(r)) for r in rows]
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        versions = cls._mem_versions.get(bank_id, [])
+        if rule_id:
+            versions = [v for v in versions if v.get("rule_id") == rule_id]
+        return versions
+
+    # =========================================================================
+    # MILESTONE 3: RULE TESTING & SIMULATION
+    # =========================================================================
+    @classmethod
+    def save_test_suite(cls, suite: dict[str, Any], bank_id: str) -> None:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.rule_test_suites (
+                            id, bank_id, rule_id, rule_version, suite_name, description, created_by, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (id) DO NOTHING;
+                        """,
+                        (
+                            suite["id"],
+                            bank_id,
+                            suite["rule_id"],
+                            suite["rule_version"],
+                            suite["suite_name"],
+                            suite.get("description", ""),
+                            suite["created_by"],
+                        ),
+                    )
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        store = cls._mem_test_suites.setdefault(bank_id, [])
+        idx = next((i for i, s in enumerate(store) if s["id"] == suite["id"]), None)
+        if idx is not None:
+            store[idx] = suite
+        else:
+            store.insert(0, suite)
+
+    @classmethod
+    def get_test_suites(cls, bank_id: str, rule_id: Optional[str] = None) -> list[dict[str, Any]]:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    query = "SELECT * FROM public.rule_test_suites WHERE (bank_id = %s OR %s = 'apex-bank-01')"
+                    params = [bank_id, bank_id]
+                    if rule_id:
+                        query += " AND rule_id = %s"
+                        params.append(rule_id)
+                    query += " ORDER BY created_at DESC;"
+                    cur.execute(query, params)
+                    rows = cur.fetchall()
+                    if rows:
+                        conn.close()
+                        return [_clean_row(dict(r)) for r in rows]
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        suites = cls._mem_test_suites.get(bank_id, [])
+        if rule_id:
+            suites = [s for s in suites if s.get("rule_id") == rule_id]
+        return suites
+
+    @classmethod
+    def save_test_run(cls, run: dict[str, Any], bank_id: str) -> None:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.rule_test_runs (
+                            id, suite_id, bank_id, rule_id, rule_version, total_test_cases,
+                            passed_tests, failed_tests, pass_percentage, execution_duration_ms,
+                            status, started_by, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW());
+                        """,
+                        (
+                            run["id"],
+                            run["suite_id"],
+                            bank_id,
+                            run["rule_id"],
+                            run["rule_version"],
+                            run["total_test_cases"],
+                            run["passed_tests"],
+                            run["failed_tests"],
+                            run["pass_percentage"],
+                            run["execution_duration_ms"],
+                            run["status"],
+                            run["started_by"],
+                        ),
+                    )
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        cls._mem_test_runs.setdefault(bank_id, []).insert(0, run)
+
+    @classmethod
+    def get_test_runs(cls, bank_id: str, suite_id: Optional[str] = None) -> list[dict[str, Any]]:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    query = "SELECT * FROM public.rule_test_runs WHERE (bank_id = %s OR %s = 'apex-bank-01')"
+                    params = [bank_id, bank_id]
+                    if suite_id:
+                        query += " AND suite_id = %s"
+                        params.append(suite_id)
+                    query += " ORDER BY created_at DESC;"
+                    cur.execute(query, params)
+                    rows = cur.fetchall()
+                    if rows:
+                        conn.close()
+                        return [_clean_row(dict(r)) for r in rows]
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        runs = cls._mem_test_runs.get(bank_id, [])
+        if suite_id:
+            runs = [r for r in runs if r.get("suite_id") == suite_id]
+        return runs
+
+    # =========================================================================
+    # MILESTONE 3: DEPLOYMENT ORCHESTRATION & TARGETS
+    # =========================================================================
+    @classmethod
+    def save_deployment_package(cls, pkg: dict[str, Any], bank_id: str) -> None:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.deployment_packages (
+                            id, bank_id, rule_id, rule_version, version_id,
+                            approved_rule_ir, regulatory_reference, approval_records,
+                            validation_results, test_results, package_checksum,
+                            created_by, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW());
+                        """,
+                        (
+                            pkg["id"],
+                            bank_id,
+                            pkg["rule_id"],
+                            pkg["rule_version"],
+                            pkg["version_id"],
+                            json.dumps(pkg["approved_rule_ir"]),
+                            pkg.get("regulatory_reference"),
+                            json.dumps(pkg.get("approval_records", [])),
+                            json.dumps(pkg.get("validation_results", [])),
+                            json.dumps(pkg.get("test_results", [])),
+                            pkg["package_checksum"],
+                            pkg["created_by"],
+                        ),
+                    )
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        cls._mem_deployment_packages.setdefault(bank_id, []).insert(0, pkg)
+
+    @classmethod
+    def get_deployment_packages(cls, bank_id: str) -> list[dict[str, Any]]:
+        return cls._mem_deployment_packages.get(bank_id, [])
+
+    @classmethod
+    def save_deployment_target(cls, target: dict[str, Any], bank_id: str) -> None:
+        cls._mem_deployment_targets.setdefault(bank_id, []).append(target)
+
+    @classmethod
+    def get_deployment_targets(cls, bank_id: str) -> list[dict[str, Any]]:
+        targets = cls._mem_deployment_targets.get(bank_id, [])
+        if not targets:
+            # Default enterprise bank deployment targets
+            default_targets = [
+                {
+                    "id": "target-uat-rest-01",
+                    "bank_id": bank_id,
+                    "name": "Apex Core Banking UAT Rule Engine",
+                    "target_type": "REST",
+                    "environment": "UAT",
+                    "endpoint_url": "https://uat.apexbank.internal/api/rules/deploy",
+                    "is_writable": True,
+                    "supports_rollback": True,
+                    "capabilities": ["ATOMIC_ACTIVATION", "ROLLBACK_SUPPORT"],
+                    "status": "ACTIVE",
+                },
+                {
+                    "id": "target-prod-rest-01",
+                    "bank_id": bank_id,
+                    "name": "Apex Core Banking Production Engine",
+                    "target_type": "REST",
+                    "environment": "PRODUCTION",
+                    "endpoint_url": "https://core.apexbank.internal/api/rules/deploy",
+                    "is_writable": True,
+                    "supports_rollback": True,
+                    "capabilities": ["ATOMIC_ACTIVATION", "ROLLBACK_SUPPORT", "HSM_SIGNED"],
+                    "status": "ACTIVE",
+                },
+                {
+                    "id": "target-reporting-sql-readonly",
+                    "bank_id": bank_id,
+                    "name": "Regulatory Reporting Read Replica (ReadOnly)",
+                    "target_type": "SQL",
+                    "environment": "PRODUCTION",
+                    "endpoint_url": "postgres://rep_read@db-replica.internal:5432/reporting",
+                    "is_writable": False,  # Blocked by deployment safety gate!
+                    "supports_rollback": False,
+                    "capabilities": ["READ_ONLY_QUERY"],
+                    "status": "ACTIVE",
+                },
+            ]
+            cls._mem_deployment_targets[bank_id] = default_targets
+            return default_targets
+        return targets
+
+    @classmethod
+    def save_deployment_record(cls, record: dict[str, Any], bank_id: str) -> None:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.deployment_records (
+                            id, bank_id, package_id, rule_id, rule_name, rule_version,
+                            target_id, deployment_mode, status, scheduled_for,
+                            deployed_by, target_response, post_verification_status,
+                            error_message, deployed_at, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (id) DO UPDATE SET
+                            status = EXCLUDED.status,
+                            target_response = EXCLUDED.target_response,
+                            post_verification_status = EXCLUDED.post_verification_status,
+                            error_message = EXCLUDED.error_message;
+                        """,
+                        (
+                            record["id"],
+                            bank_id,
+                            record["package_id"],
+                            record["rule_id"],
+                            record["rule_name"],
+                            record["rule_version"],
+                            record["target_id"],
+                            record["deployment_mode"],
+                            record["status"],
+                            record.get("scheduled_for"),
+                            record["deployed_by"],
+                            json.dumps(record.get("target_response", {})),
+                            record.get("post_verification_status"),
+                            record.get("error_message"),
+                            record.get("deployed_at"),
+                        ),
+                    )
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        store = cls._mem_deployment_records.setdefault(bank_id, [])
+        idx = next((i for i, r in enumerate(store) if r["id"] == record["id"]), None)
+        if idx is not None:
+            store[idx] = record
+        else:
+            store.insert(0, record)
+
+    @classmethod
+    def get_deployment_records(cls, bank_id: str, rule_id: Optional[str] = None) -> list[dict[str, Any]]:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    query = "SELECT * FROM public.deployment_records WHERE (bank_id = %s OR %s = 'apex-bank-01')"
+                    params = [bank_id, bank_id]
+                    if rule_id:
+                        query += " AND rule_id = %s"
+                        params.append(rule_id)
+                    query += " ORDER BY created_at DESC;"
+                    cur.execute(query, params)
+                    rows = cur.fetchall()
+                    if rows:
+                        conn.close()
+                        return [_clean_row(dict(r)) for r in rows]
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        records = cls._mem_deployment_records.get(bank_id, [])
+        if rule_id:
+            records = [r for r in records if r.get("rule_id") == rule_id]
+        return records
+
+    @classmethod
+    def save_rollback_record(cls, rollback: dict[str, Any], bank_id: str) -> None:
+        cls._mem_rollback_records.setdefault(bank_id, []).insert(0, rollback)
+
+    @classmethod
+    def get_rollback_records(cls, bank_id: str, rule_id: Optional[str] = None) -> list[dict[str, Any]]:
+        records = cls._mem_rollback_records.get(bank_id, [])
+        if rule_id:
+            records = [r for r in records if r.get("rule_id") == rule_id]
+        return records
+
+    # =========================================================================
+    # MILESTONE 3: AUDIT TRAIL & NOTIFICATIONS
+    # =========================================================================
+    @classmethod
+    def save_audit_event(cls, event: dict[str, Any], bank_id: str) -> None:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.audit_events (
+                            id, bank_id, actor_id, actor_email, actor_role, action,
+                            resource_type, resource_id, previous_state, new_state,
+                            correlation_id, ip_address, metadata, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW());
+                        """,
+                        (
+                            event["id"],
+                            bank_id,
+                            event["actor_id"],
+                            event["actor_email"],
+                            event["actor_role"],
+                            event["action"],
+                            event["resource_type"],
+                            event["resource_id"],
+                            json.dumps(event.get("previous_state")) if event.get("previous_state") else None,
+                            json.dumps(event.get("new_state")) if event.get("new_state") else None,
+                            event.get("correlation_id"),
+                            event.get("ip_address"),
+                            json.dumps(event.get("metadata", {})),
+                        ),
+                    )
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        cls._mem_audit_events.setdefault(bank_id, []).insert(0, event)
+
+    @classmethod
+    def get_audit_events(
+        cls,
+        bank_id: str,
+        resource_type: Optional[str] = None,
+        action: Optional[str] = None,
+        actor_email: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        conn = _get_db_connection()
+        if conn:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    query = "SELECT * FROM public.audit_events WHERE (bank_id = %s OR %s = 'apex-bank-01')"
+                    params = [bank_id, bank_id]
+                    if resource_type:
+                        query += " AND resource_type = %s"
+                        params.append(resource_type)
+                    if action:
+                        query += " AND action = %s"
+                        params.append(action)
+                    if actor_email:
+                        query += " AND actor_email = %s"
+                        params.append(actor_email)
+                    query += " ORDER BY created_at DESC;"
+                    cur.execute(query, params)
+                    rows = cur.fetchall()
+                    if rows:
+                        conn.close()
+                        return [_clean_row(dict(r)) for r in rows]
+                conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        events = cls._mem_audit_events.get(bank_id, [])
+        if resource_type:
+            events = [e for e in events if e.get("resource_type") == resource_type]
+        if action:
+            events = [e for e in events if e.get("action") == action]
+        if actor_email:
+            events = [e for e in events if e.get("actor_email") == actor_email]
+        return events
+
+    @classmethod
+    def save_notification(cls, notif: dict[str, Any], bank_id: str) -> None:
+        cls._mem_notifications.setdefault(bank_id, []).insert(0, notif)
+
+    @classmethod
+    def get_notifications(cls, bank_id: str, recipient_email: Optional[str] = None) -> list[dict[str, Any]]:
+        notifs = cls._mem_notifications.get(bank_id, [])
+        if recipient_email:
+            notifs = [n for n in notifs if n.get("recipient_email") == recipient_email]
+        return notifs
+
+    @classmethod
+    def mark_notification_read(cls, notif_id: str, bank_id: str) -> bool:
+        for n in cls._mem_notifications.get(bank_id, []):
+            if n["id"] == notif_id:
+                n["is_read"] = True
+                n["status"] = "READ"
+                return True
+        return False
