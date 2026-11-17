@@ -152,8 +152,84 @@ def normalize_to_rule_ir(data: dict[str, Any]) -> RuleIR:
     )
 
 
+def _extract_text_from_binary(content: Union[str, bytes], fmt: str, filename: str) -> str:
+    """Extracts plain text and tabular content from binary PDF, DOCX, or XLSX sources."""
+    import base64
+    import io
+    import os
+
+    raw_bytes: bytes
+    if isinstance(content, str):
+        if os.path.exists(content):
+            with open(content, "rb") as f:
+                raw_bytes = f.read()
+        elif content.startswith("data:") and ";base64," in content:
+            raw_bytes = base64.b64decode(content.split(";base64,")[1])
+        else:
+            try:
+                raw_bytes = base64.b64decode(content, validate=True)
+            except Exception:
+                raw_bytes = content.encode("utf-8")
+    else:
+        raw_bytes = content
+
+    if fmt == "pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+            pages = [p.extract_text() for p in reader.pages if p.extract_text()]
+            extracted = "\n\n".join(pages).strip()
+            if not extracted:
+                raise ValueError(f"PDF document '{filename}' contains no readable text.")
+            return extracted
+        except Exception as exc:
+            raise ValueError(f"Failed to extract text from PDF '{filename}': {exc}") from exc
+
+    elif fmt in ("docx", "doc"):
+        try:
+            import docx
+            doc = docx.Document(io.BytesIO(raw_bytes))
+            lines = [p.text for p in doc.paragraphs if p.text.strip()]
+            for tbl in doc.tables:
+                for row in tbl.rows:
+                    row_txt = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
+                    if row_txt:
+                        lines.append(row_txt)
+            extracted = "\n".join(lines).strip()
+            if not extracted:
+                raise ValueError(f"DOCX document '{filename}' is empty.")
+            return extracted
+        except Exception as exc:
+            raise ValueError(f"Failed to extract text from DOCX '{filename}': {exc}") from exc
+
+    elif fmt in ("xlsx", "xls"):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+            lines = []
+            for sheetname in wb.sheetnames:
+                ws = wb[sheetname]
+                rows = [list(r) for r in ws.iter_rows(values_only=True) if any(r)]
+                if len(rows) >= 2:
+                    headers = [str(h).strip().lower() for h in rows[0] if h is not None]
+                    for idx, row in enumerate(rows[1:]):
+                        row_parts = [f"{str(val).strip()}" for val in row if val is not None]
+                        lines.append(f"Rule {idx + 1}. " + " | ".join(row_parts))
+                else:
+                    for r in rows:
+                        lines.append(" | ".join(str(v).strip() for v in r if v is not None))
+            extracted = "\n\n".join(lines).strip()
+            if not extracted:
+                raise ValueError(f"XLSX spreadsheet '{filename}' is empty.")
+            return extracted
+        except Exception as exc:
+            raise ValueError(f"Failed to extract text from XLSX '{filename}': {exc}") from exc
+
+    return raw_bytes.decode("utf-8", errors="ignore")
+
+
 def extract_rules_from_existing_content(
-    content: str,
+    content: Union[str, bytes],
     filename: str,
     file_format: str,
     bank_id: Optional[str] = None,
@@ -166,13 +242,22 @@ def extract_rules_from_existing_content(
     rules: list[RuleIR] = []
     fmt = file_format.lower().replace(".", "").strip()
 
-    ALLOWED_FORMATS = {"json", "yaml", "yml", "xml", "sql", "pdf", "docx", "xlsx", "txt", "md", "csv"}
+    ALLOWED_FORMATS = {"json", "yaml", "yml", "xml", "sql", "pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "csv"}
     if fmt not in ALLOWED_FORMATS:
         raise ValueError(
             f"Unsupported file format '{fmt}'. Allowed formats are: {', '.join(sorted(ALLOWED_FORMATS))}."
         )
 
-    if not content or not content.strip():
+    if not content:
+        raise ValueError(f"Document '{filename}' is empty. No rules could be extracted.")
+
+    # 0. Binary extraction for PDF, DOCX, XLSX
+    if fmt in ("pdf", "docx", "doc", "xlsx", "xls"):
+        content = _extract_text_from_binary(content, fmt, filename)
+    elif isinstance(content, bytes):
+        content = content.decode("utf-8", errors="ignore")
+
+    if isinstance(content, str) and not content.strip():
         raise ValueError(f"Document '{filename}' is empty. No rules could be extracted.")
 
     # 1. Direct JSON extraction
@@ -419,8 +504,68 @@ def extract_obligations_from_circular(
 ) -> list[dict[str, Any]]:
     """
     Extracts structured regulatory obligations and candidate Rule IR representations
-    from newly uploaded regulatory circulars.
+    from newly uploaded regulatory circulars using Groq Qwen AI with deterministic fallback.
     """
+    # 1. Attempt Groq Qwen AI structured extraction
+    try:
+        from cidan.services.ai_engine import ai_engine
+        ai_obs, engine_used = ai_engine.extract_obligations(
+            circular_text=circular_text,
+            circular_number=circular_number,
+            authority=authority,
+        )
+        if ai_obs:
+            formatted_ai = []
+            for ob in ai_obs:
+                cid = ob.get("clause_id", "CL-01")
+                cat = ob.get("category", "GENERAL").upper()
+                amt = ob.get("amount_threshold")
+                conds = []
+                if amt is not None:
+                    conds.append(ConditionNode(
+                        field="transaction_amount",
+                        operator="gte",
+                        value=amt,
+                        value_type="numeric",
+                        unit=ob.get("currency") or "INR",
+                    ))
+                cand_ir = RuleIR(
+                    bank_id=bank_id,
+                    rule_id=f"OBLIG-{cat[:3]}-{uuid.uuid4().hex[:6].upper()}",
+                    rule_name=ob.get("text", f"Obligation {cid}")[:80],
+                    description=ob.get("text", ""),
+                    category=cat,
+                    source_type="REGULATORY_CIRCULAR",
+                    condition_tree=ConditionTree(operator="AND", conditions=conds),
+                    actions=[ActionNode(action_type=ob.get("action_type", "FLAG_REVIEW"), target="transaction")],
+                    traceability={
+                        "circular_number": circular_number,
+                        "authority": authority,
+                        "clause_id": cid,
+                        "excerpt": ob.get("supporting_excerpt", ""),
+                        "filename": filename,
+                    },
+                )
+                formatted_ai.append({
+                    "obligation_id": f"OBLIG-{circular_number.replace('/', '-')}-{cid}",
+                    "clause_id": cid,
+                    "issuing_authority": authority,
+                    "circular_number": circular_number,
+                    "category": cat,
+                    "requirement_text": ob.get("text", ""),
+                    "effective_date": ob.get("effective_date", "not_specified"),
+                    "confidence": ob.get("confidence_score", 0.95),
+                    "candidate_rule_ir": cand_ir.model_dump(),
+                    "supporting_excerpt": ob.get("supporting_excerpt", ""),
+                    "reasoning": ob.get("reasoning", ""),
+                    "extracted_by": "GROQ_QWEN_3.8_27B",
+                    "engine_used": "GROQ_QWEN_3.8_27B",
+                })
+            return formatted_ai
+    except Exception as exc:
+        pass
+
+    # 2. Deterministic NLP Fallback
     obligations: list[dict[str, Any]] = []
     
     # Split text by sections, clauses, or paragraph chunks

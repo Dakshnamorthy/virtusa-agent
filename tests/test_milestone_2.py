@@ -344,3 +344,89 @@ def test_api_cross_bank_denial(client):
     )
     assert res.status_code == 403
     assert "Cross-bank access denied" in res.json()["detail"]
+
+
+# ============================================================================
+# 5. DOCUMENT EXTRACTION (PDF, DOCX, XLSX, JSON, XML, YAML, SQL) & OTP TESTS
+# ============================================================================
+
+def test_extract_rules_from_pdf():
+    pdf_path = "E:/virtusa-agent/Synvora_Regulatory Circular to Live Rule Engine (2).pdf"
+    rules = extract_rules_from_existing_content(
+        content=pdf_path,
+        filename="Synvora_Regulatory.pdf",
+        file_format="pdf",
+        bank_id="apex-bank-01",
+    )
+    assert len(rules) >= 1
+    assert any(r.rule_name for r in rules)
+    assert rules[0].bank_id == "apex-bank-01"
+
+
+def test_extract_rules_from_docx():
+    import io, docx
+    doc = docx.Document()
+    doc.add_heading("KYC and AML Bank Handbook", 0)
+    doc.add_paragraph("Clause 1. Mandatory Threshold: Transactions above INR 500000 require senior officer approval.")
+    buf = io.BytesIO()
+    doc.save(buf)
+    
+    rules = extract_rules_from_existing_content(
+        content=buf.getvalue(),
+        filename="handbook.docx",
+        file_format="docx",
+        bank_id="apex-bank-01",
+    )
+    assert len(rules) >= 1
+    assert any("500000" in str(r.model_dump()) or "senior" in str(r.model_dump()).lower() for r in rules)
+
+
+def test_extract_rules_from_xlsx():
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "CoreRules"
+    ws.append(["RuleID", "Description", "Threshold", "Action"])
+    ws.append(["LEND-001", "Mortgage LTV Limit Requirement: Max LTV ratio 80 percent", 80, "BLOCK"])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    rules = extract_rules_from_existing_content(
+        content=buf.getvalue(),
+        filename="rules.xlsx",
+        file_format="xlsx",
+        bank_id="apex-bank-01",
+    )
+    assert len(rules) >= 1
+    assert any("LTV" in r.rule_name or "Mortgage" in r.rule_name or "LEND" in r.rule_id for r in rules)
+
+
+def test_api_dispatch_otp_endpoint(client):
+    res = client.post(
+        "/auth/dispatch-otp",
+        json={
+            "email": "test-compliance@apexbank.com",
+            "otp": "482910",
+            "bank_id": "apex-bank-01",
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["success"] is True
+    assert data["email"] == "test-compliance@apexbank.com"
+    # Never expose credentials in response
+    assert "password" not in str(data).lower()
+    assert "token" not in str(data).lower() or data.get("token") is None
+
+
+def test_api_extract_file_multipart(client):
+    import io
+    sql_content = b"CREATE RULE aml_high_val AS WHERE (amount >= 750000);"
+    res = client.post(
+        "/rules/extract-file",
+        files={"file": ("aml_rules.sql", io.BytesIO(sql_content), "application/sql")},
+    )
+    assert res.status_code == 200
+    rules = res.json()
+    assert len(rules) >= 1
+    assert any("aml_high_val" in r["rule_name"] for r in rules)

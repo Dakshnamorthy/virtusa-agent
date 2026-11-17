@@ -63,6 +63,7 @@ class RuleDelta(BaseModel):
     confidence_score: float = Field(default=0.95, ge=0.0, le=1.0)
     evidence_sources: list[dict[str, Any]] = Field(default_factory=list)
     review_status: Literal["PENDING", "ACCEPTED", "MODIFIED", "REJECTED", "NEEDS_REVIEW"] = "PENDING"
+    engine_used: str = "CIDAN_AI"
     created_at: Optional[str] = None
 
 
@@ -74,6 +75,7 @@ class DeltaAnalysisResult(BaseModel):
     circular_id: Optional[str] = None
     circular_number: Optional[str] = None
     status: Literal["PROCESSING", "COMPLETED", "FAILED"] = "COMPLETED"
+    engine_used: str = "CIDAN_AI"
     total_rules: int = 0
     additions_count: int = 0
     modifications_count: int = 0
@@ -171,6 +173,20 @@ def run_delta_analysis(
             "text": req_text[:300],
         }
 
+        # 1. Attempt Groq Qwen AI semantic classification
+        ai_judgment = None
+        engine_used_tag = "CIDAN_DETERMINISTIC_FALLBACK"
+        try:
+            from cidan.services.ai_engine import ai_engine
+            ai_judgment, engine_name = ai_engine.classify_delta_semantic(
+                obligation=obl,
+                existing_rules=[r.model_dump() for r in existing_rules],
+            )
+            if ai_judgment:
+                engine_used_tag = engine_name
+        except Exception:
+            pass
+
         # Attempt to match with existing bank rules
         best_match, score = _find_best_rule_match(cand_rule, existing_rules)
 
@@ -181,10 +197,15 @@ def run_delta_analysis(
             proposed_ir.bank_id = bank_id
             proposed_ir.rule_id = f"PROPOSED-{cand_rule.category[:3]}-{uuid.uuid4().hex[:6].upper()}"
 
+            classification_val = ai_judgment.classification if ai_judgment else "ADDITION"
+            reason_val = ai_judgment.reason if ai_judgment else f"New regulatory requirement introduced in clause {clause_id}. Bank currently has no active rule covering this mandate."
+            impact_val = ai_judgment.impact_assessment if ai_judgment else "Operational compliance gap. Rule must be introduced to avoid regulatory non-compliance penalty."
+            conf_val = ai_judgment.confidence_score if ai_judgment else obl.get("confidence", 0.94)
+
             delta = RuleDelta(
                 analysis_id=analysis_id,
                 bank_id=bank_id,
-                classification="ADDITION",
+                classification=classification_val,
                 category=cand_rule.category,
                 rule_name=f"New Mandate: {cand_rule.rule_name}",
                 regulatory_obligation_id=obl.get("obligation_id"),
@@ -198,9 +219,10 @@ def run_delta_analysis(
                     )
                 ],
                 proposed_change=proposed_ir.model_dump(),
-                reason=f"New regulatory requirement introduced in clause {clause_id}. Bank currently has no active rule covering this mandate.",
-                impact_assessment="Operational compliance gap. Rule must be introduced to avoid regulatory non-compliance penalty.",
-                confidence_score=obl.get("confidence", 0.94),
+                reason=reason_val,
+                impact_assessment=impact_val,
+                confidence_score=conf_val,
+                engine_used=engine_used_tag,
                 evidence_sources=[citation],
             )
             deltas.append(delta)

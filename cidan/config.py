@@ -21,6 +21,15 @@ class Settings:
     max_pdf_bytes: int = 25 * 1024 * 1024
     llm_timeout_seconds: float = 60
     llm_max_output_tokens: int = 400
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_sender_name: str = "CIDAN Regulatory AI"
+    database_url: str | None = None
+    supabase_url: str = "https://vettckrwudnnvoalvjno.supabase.co"
+    supabase_service_role_key: str | None = None
+    supabase_anon_key: str | None = None
 
     @property
     def llm_configured(self) -> bool:
@@ -50,6 +59,15 @@ def get_settings() -> Settings:
         source_pdf_directory=source_dir,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         llm_max_output_tokens=llm_max_output_tokens,
+        smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com"),
+        smtp_port=int(os.getenv("SMTP_PORT", "587")),
+        smtp_user=os.getenv("SMTP_USER") or None,
+        smtp_password=os.getenv("SMTP_PASSWORD") or None,
+        smtp_sender_name=os.getenv("SMTP_SENDER_NAME", "CIDAN Regulatory AI"),
+        database_url=os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL") or None,
+        supabase_url=os.getenv("SUPABASE_URL", "https://vettckrwudnnvoalvjno.supabase.co"),
+        supabase_service_role_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY") or None,
+        supabase_anon_key=os.getenv("SUPABASE_ANON_KEY") or None,
     )
 
 
