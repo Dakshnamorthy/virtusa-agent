@@ -10,11 +10,17 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from cidan.config import ConfigurationError, get_settings
-from cidan.agents.reporting import render_markdown
 from cidan.ingestion.pdf_loader import classify_document, find_pdfs, ingestion_status, load_pdf
-from cidan.ingestion.vector_store import ingest
 from cidan.services.approval_service import approve_rule, export_preview
-from cidan.services.workflow_service import execute_workflow
+from cidan.services.integration_service import (
+    ExistingRuleDto,
+    FetchRulesRequest,
+    IntegrationService,
+    IntegrationVerifyRequest,
+    IntegrationVerifyResponse,
+    SchemaInspectRequest,
+    SchemaInspectResponse,
+)
 from cidan.workflow.persistence import load_workflow, list_workflows
 
 logger = logging.getLogger(__name__)
@@ -71,7 +77,7 @@ def health() -> dict[str, Any]:
         "source_directory": str(settings.source_pdf_directory),
         "message": (
             None if configured
-            else "Configure GROQ_API_KEY and CIDAN_ACCESS_TOKEN before using protected API operations."
+            else "Configure LLM credentials and CIDAN_ACCESS_TOKEN before using protected API operations."
         ),
     }
 
@@ -168,6 +174,8 @@ async def upload_documents(
 @app.post("/ingest")
 def ingest_documents(_: None = Depends(require_access_token)) -> dict[str, Any]:
     try:
+        from cidan.ingestion.vector_store import ingest
+
         return ingest()
     except ConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -185,6 +193,8 @@ def ingest_documents(_: None = Depends(require_access_token)) -> dict[str, Any]:
 @app.post("/workflows/analyze", status_code=201)
 def analyze(_: None = Depends(require_access_token)) -> dict[str, Any]:
     try:
+        from cidan.services.workflow_service import execute_workflow
+
         result = execute_workflow()
     except Exception as exc:
         logger.exception("Workflow execution failed unexpectedly")
@@ -239,6 +249,8 @@ def workflow_report_markdown(
     workflow_id: str,
     _: None = Depends(require_access_token),
 ) -> PlainTextResponse:
+    from cidan.agents.reporting import render_markdown
+
     report = workflow_report(workflow_id)
     return PlainTextResponse(render_markdown(report), media_type="text/markdown")
 
@@ -288,3 +300,48 @@ def preview_export(rule_id: str, _: None = Depends(require_access_token)) -> dic
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+# ============================================================================
+# MILESTONE 1: BANKING INTEGRATION ENDPOINTS
+# ============================================================================
+
+
+@app.post(
+    "/integrations/verify",
+    response_model=IntegrationVerifyResponse,
+    summary="Verify Banking Integration Source Connection",
+    description="Securely verifies connection to REST, GraphQL, SQL, or NoSQL sources with strict timeouts.",
+)
+def verify_integration(
+    request: IntegrationVerifyRequest,
+    _: None = Depends(require_access_token),
+) -> IntegrationVerifyResponse:
+    return IntegrationService.verify_connection(request)
+
+
+@app.post(
+    "/integrations/inspect-schema",
+    response_model=SchemaInspectResponse,
+    summary="Inspect Integration Source Schema",
+    description="Safely inspects tables, collections, and metadata for a verified integration source.",
+)
+def inspect_schema(
+    request: SchemaInspectRequest,
+    _: None = Depends(require_access_token),
+) -> SchemaInspectResponse:
+    return IntegrationService.inspect_schema(request)
+
+
+@app.post(
+    "/integrations/fetch-rules",
+    response_model=list[ExistingRuleDto],
+    summary="Fetch Existing Compliance Rules",
+    description="Safely retrieves sample active rules for a bank tenant with zero arbitrary SQL execution.",
+)
+def fetch_rules(
+    request: FetchRulesRequest,
+    _: None = Depends(require_access_token),
+) -> list[ExistingRuleDto]:
+    return IntegrationService.fetch_rules(request)
+

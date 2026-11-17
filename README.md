@@ -159,6 +159,9 @@ bearer-token authentication; use Swagger's **Authorize** button. Main endpoints:
 - `GET /rules` and `GET /rules/{rule_id}` — proposal status and evidence.
 - `POST /rules/{rule_id}/approve` — requires a reviewer identifier and successful tests.
 - `POST /rules/{rule_id}/export-preview` — requires explicit local approval.
+- `POST /integrations/verify` — secure connection verification for REST, GraphQL, SQL (PostgreSQL, MySQL, Oracle, MSSQL), and NoSQL (MongoDB, Cassandra, Redis) sources with strict timeouts.
+- `POST /integrations/inspect-schema` — safe schema, tables, and column introspection for verified banking integration sources.
+- `POST /integrations/fetch-rules` — read-only sample compliance rule retrieval with strict tenant isolation by `bank_id`.
 
 When the server is running, `Invoke-RestMethod http://127.0.0.1:8000/health` reports
 configuration state without returning credentials. Use Swagger's **Authorize** button
