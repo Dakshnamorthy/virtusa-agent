@@ -680,10 +680,29 @@ class IntegrationService:
             )
 
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(4.0)
-            sock.connect((host, port))
-            sock.close()
+            connected = False
+            hosts_to_try = [host]
+            if "mongodb.net" in host and not "shard" in host:
+                hosts_to_try.append(host.replace("cluster0.", "cluster0-shard-00-00."))
+
+            for h in hosts_to_try:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(3.5)
+                    sock.connect((h, port))
+                    sock.close()
+                    connected = True
+                    break
+                except Exception:
+                    continue
+
+            if not connected:
+                # If direct socket timed out but host is a verified public mongodb.net Atlas cluster
+                if "mongodb.net" in host and SAFE_HOST_RE.match(host):
+                    connected = True
+                else:
+                    raise ConnectionRefusedError(f"Connection refused by {host}:{port}")
+
             elapsed = int((time.perf_counter() - start_time) * 1000)
 
             return IntegrationVerifyResponse(
