@@ -556,13 +556,15 @@ class IntegrationService:
             try:
                 import psycopg2
 
+                ssl_mode = "require" if (not req.ssl_config or req.ssl_config.get("enabled", True)) else "prefer"
                 conn = psycopg2.connect(
                     host=host,
                     port=port,
                     dbname=db_name,
                     user=service_account,
                     password=password,
-                    connect_timeout=4,
+                    sslmode=ssl_mode,
+                    connect_timeout=6,
                 )
                 cur = conn.cursor()
                 cur.execute("SELECT version();")
@@ -758,7 +760,8 @@ class IntegrationService:
                         dbname=db_name,
                         user=service_account,
                         password=password,
-                        connect_timeout=4,
+                        sslmode="require",
+                        connect_timeout=6,
                     )
                     cur = conn.cursor()
 
@@ -898,7 +901,8 @@ class IntegrationService:
                     dbname=db_name,
                     user=service_account,
                     password=password,
-                    connect_timeout=4,
+                    sslmode="require",
+                    connect_timeout=6,
                 )
                 cur = conn.cursor()
 
